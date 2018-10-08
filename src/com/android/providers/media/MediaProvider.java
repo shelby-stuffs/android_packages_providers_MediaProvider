@@ -106,9 +106,11 @@ import android.text.format.DateUtils;
 import android.util.ArrayMap;
 import android.util.ArraySet;
 import android.util.Log;
+import android.util.Pair;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.os.BackgroundThread;
+import com.android.internal.util.ArrayUtils;
 
 import libcore.io.IoUtils;
 import libcore.util.EmptyArray;
@@ -682,7 +684,8 @@ public class MediaProvider extends ContentProvider {
                 + "tags TEXT,category TEXT,language TEXT,mini_thumb_data TEXT,name TEXT,"
                 + "media_type INTEGER,old_id INTEGER,is_drm INTEGER,"
                 + "width INTEGER, height INTEGER, title_resource_uri TEXT,"
-                + "owner_package_name TEXT DEFAULT NULL)");
+                + "owner_package_name TEXT DEFAULT NULL,"
+                + "color_standard INTEGER, color_transfer INTEGER, color_range INTEGER)");
         db.execSQL("CREATE TABLE log (time DATETIME, message TEXT)");
         if (!internal) {
             db.execSQL("CREATE TABLE audio_genres (_id INTEGER PRIMARY KEY,name TEXT NOT NULL)");
@@ -816,7 +819,7 @@ public class MediaProvider extends ContentProvider {
                 + " WHERE (is_alarm IS 1) OR (is_ringtone IS 1) OR (is_notification IS 1)");
     }
 
-    private static void updateFromPSchema(SQLiteDatabase db, boolean internal) {
+    private static void updateAddOwnerPackageName(SQLiteDatabase db, boolean internal) {
         db.execSQL("ALTER TABLE files ADD COLUMN owner_package_name TEXT DEFAULT NULL");
 
         // Derive new column value based on well-known paths
@@ -840,8 +843,13 @@ public class MediaProvider extends ContentProvider {
                 }
             }
         }
+    }
 
-        createLatestViews(db, internal);
+    private static void updateAddColorSpaces(SQLiteDatabase db, boolean internal) {
+        // Add the color aspects related column used for HDR detection etc.
+        db.execSQL("ALTER TABLE files ADD COLUMN color_standard INTEGER;");
+        db.execSQL("ALTER TABLE files ADD COLUMN color_transfer INTEGER;");
+        db.execSQL("ALTER TABLE files ADD COLUMN color_range INTEGER;");
     }
 
     static final int VERSION_J = 509;
@@ -872,11 +880,18 @@ public class MediaProvider extends ContentProvider {
             updateFromKKSchema(db);
         } else if (fromVersion < 900) {
             updateFromOCSchema(db);
-        } else if (fromVersion < 1000) {
-            updateFromPSchema(db, internal);
-        } else if (fromVersion < 1002) {
-            createLatestViews(db, internal);
+        } else {
+            if (fromVersion < 1000) {
+                updateAddOwnerPackageName(db, internal);
+            }
+            if (fromVersion < 1003) {
+                updateAddColorSpaces(db, internal);
+            }
         }
+
+        // Always recreate latest views during upgrade; they're cheap and it's
+        // an easy way to ensure they're defined consistently
+        createLatestViews(db, internal);
 
         sanityCheck(db, fromVersion);
 
@@ -1199,16 +1214,19 @@ public class MediaProvider extends ContentProvider {
             groupBy = "audio.album_id";
         }
 
-        // Some apps are abusing the "WHERE" clause by injecting "GROUP BY"
-        // clauses; gracefully lift them out.
         if (getCallingPackageTargetSdkVersion() < Build.VERSION_CODES.Q) {
-            final int groupByIndex = (selection != null) ? selection.indexOf(") GROUP BY (") : -1;
-            if (groupByIndex != -1) {
-                final String original = selection;
-                selection = original.substring(0, groupByIndex);
-                groupBy = original.substring(groupByIndex + ") GROUP BY (".length());
-                Log.w(TAG, "Recovered abusive '" + selection + "' and '" + groupBy + "' from '"
-                        + original + "'");
+            // Some apps are abusing the "WHERE" clause by injecting "GROUP BY"
+            // clauses; gracefully lift them out.
+            final Pair<String, String> selectionAndGroupBy = recoverAbusiveGroupBy(
+                    Pair.create(selection, groupBy));
+            selection = selectionAndGroupBy.first;
+            groupBy = selectionAndGroupBy.second;
+
+            // Some apps are abusing the first column to inject "DISTINCT";
+            // gracefully lift them out.
+            if (!ArrayUtils.isEmpty(projectionIn) && projectionIn[0].startsWith("DISTINCT ")) {
+                projectionIn[0] = projectionIn[0].substring("DISTINCT ".length());
+                qb.setDistinct(true);
             }
         }
 
@@ -2305,6 +2323,8 @@ public class MediaProvider extends ContentProvider {
                 rowId = insertFile(helper, uri, initialValues,
                         FileColumns.MEDIA_TYPE_NONE, true, notifyRowIds);
                 if (rowId > 0) {
+                    MediaDocumentsProvider.onMediaStoreInsert(
+                            getContext(), volumeName, FileColumns.MEDIA_TYPE_NONE, rowId);
                     newUri = Files.getContentUri(volumeName, rowId);
                 }
                 break;
@@ -2415,16 +2435,7 @@ public class MediaProvider extends ContentProvider {
         // a nomedia path was removed, so clear the nomedia paths
         MediaScanner.clearMediaPathCache(false /* media */, true /* nomedia */);
         final DatabaseHelper helper;
-        String[] internalPaths = new String[] {
-            Environment.getRootDirectory() + "/media",
-            Environment.getOemDirectory() + "/media",
-        };
-
-        if (path.startsWith(internalPaths[0]) || path.startsWith(internalPaths[1])) {
-            helper = getDatabaseForUri(MediaStore.Audio.Media.INTERNAL_CONTENT_URI);
-        } else {
-            helper = getDatabaseForUri(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI);
-        }
+        helper = getDatabaseForUri(MediaStore.Audio.Media.getContentUriForPath(path));
         SQLiteDatabase db = helper.getWritableDatabase();
         new ScannerClient(getContext(), db, path);
     }
@@ -3144,6 +3155,7 @@ public class MediaProvider extends ContentProvider {
         //        ", where=" + userWhere + ", args=" + Arrays.toString(whereArgs) + " caller:" +
         //        Binder.getCallingPid());
 
+        final String volumeName = getVolumeName(uri);
         final boolean allowHidden = isCallingPackageAllowedHidden();
         final int match = matchUri(uri, allowHidden);
 
@@ -3170,13 +3182,19 @@ public class MediaProvider extends ContentProvider {
         // if the media type is being changed, check if it's being changed from image or video
         // to something else
         if (initialValues.containsKey(FileColumns.MEDIA_TYPE)) {
-            long newMediaType = initialValues.getAsLong(FileColumns.MEDIA_TYPE);
+            final int newMediaType = initialValues.getAsInteger(FileColumns.MEDIA_TYPE);
+
+            // If we're changing media types, invalidate any cached "empty"
+            // answers for the new collection type.
+            MediaDocumentsProvider.onMediaStoreInsert(
+                    getContext(), volumeName, newMediaType, -1);
+
             helper.mNumQueries++;
             Cursor cursor = qb.query(db, sMediaTableColumns, userWhere, userWhereArgs, null, null,
                     null, null);
             try {
                 while (cursor != null && cursor.moveToNext()) {
-                    long curMediaType = cursor.getLong(1);
+                    final int curMediaType = cursor.getInt(1);
                     if (curMediaType == FileColumns.MEDIA_TYPE_IMAGE &&
                             newMediaType != FileColumns.MEDIA_TYPE_IMAGE) {
                         Log.i(TAG, "need to remove image thumbnail for id " + cursor.getString(0));
@@ -5131,15 +5149,98 @@ public class MediaProvider extends ContentProvider {
 
     {
         sGreylist.add(Pattern.compile(
-                "(?i)count\\(\\*\\)"));
+                "(?i)[_a-z0-9]+ as [_a-z0-9]+"));
+        sGreylist.add(Pattern.compile(
+                "(?i)(min|max|sum|avg|total|count)\\(([_a-z0-9]+|\\*)\\)( as [_a-z0-9]+)?"));
         sGreylist.add(Pattern.compile(
                 "case when case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added \\* \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added / \\d+ else \\d+ end > case when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified \\* \\d+ when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified / \\d+ else \\d+ end then case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added \\* \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added / \\d+ else \\d+ end else case when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified \\* \\d+ when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified / \\d+ else \\d+ end end as corrected_added_modified"));
         sGreylist.add(Pattern.compile(
                 "MAX\\(case when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken \\* \\d+ when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken / \\d+ else \\d+ end\\)"));
         sGreylist.add(Pattern.compile(
-                "(?i)\\d+ as orientation"));
+                "MAX\\(case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added \\* \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added / \\d+ else \\d+ end\\)"));
+        sGreylist.add(Pattern.compile(
+                "MAX\\(case when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified \\* \\d+ when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified / \\d+ else \\d+ end\\)"));
         sGreylist.add(Pattern.compile(
                 "\"content://media/[a-z]+/audio/media\""));
+    }
+
+    /**
+     * Simple attempt to balance the given SQL expression by adding parenthesis
+     * when needed.
+     * <p>
+     * Since this is only used for recovering from abusive apps, we're not
+     * interested in trying to build a fully valid SQL parser up in Java. It'll
+     * give up when it encounters complex SQL, such as string literals.
+     */
+    @VisibleForTesting
+    static @Nullable String maybeBalance(@Nullable String sql) {
+        if (sql == null) return null;
+
+        int count = 0;
+        char literal = '\0';
+        for (int i = 0; i < sql.length(); i++) {
+            final char c = sql.charAt(i);
+
+            if (c == '\'' || c == '"') {
+                if (literal == '\0') {
+                    // Start literal
+                    literal = c;
+                } else if (literal == c) {
+                    // End literal
+                    literal = '\0';
+                }
+            }
+
+            if (literal == '\0') {
+                if (c == '(') {
+                    count++;
+                } else if (c == ')') {
+                    count--;
+                }
+            }
+        }
+        while (count > 0) {
+            sql = sql + ")";
+            count--;
+        }
+        while (count < 0) {
+            sql = "(" + sql;
+            count++;
+        }
+        return sql;
+    }
+
+    /**
+     * Gracefully recover from abusive callers that are smashing invalid
+     * {@code GROUP BY} clauses into {@code WHERE} clauses.
+     */
+    @VisibleForTesting
+    static Pair<String, String> recoverAbusiveGroupBy(Pair<String, String> selectionAndGroupBy) {
+        final String origSelection = selectionAndGroupBy.first;
+        final String origGroupBy = selectionAndGroupBy.second;
+
+        final int index = (origSelection != null)
+                ? origSelection.toUpperCase().indexOf(" GROUP BY ") : -1;
+        if (index != -1) {
+            String selection = origSelection.substring(0, index);
+            String groupBy = origSelection.substring(index + " GROUP BY ".length());
+
+            // Try balancing things out
+            selection = maybeBalance(selection);
+            groupBy = maybeBalance(groupBy);
+
+            // Yell if we already had a group by requested
+            if (!TextUtils.isEmpty(origGroupBy)) {
+                throw new IllegalArgumentException(
+                        "Abusive '" + groupBy + "' conflicts with requested '" + origGroupBy + "'");
+            }
+
+            Log.w(TAG, "Recovered abusive '" + selection + "' and '" + groupBy + "' from '"
+                    + origSelection + "'");
+            return Pair.create(selection, groupBy);
+        } else {
+            return selectionAndGroupBy;
+        }
     }
 
     private static String getVolumeName(Uri uri) {
