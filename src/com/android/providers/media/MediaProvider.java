@@ -19,14 +19,8 @@ package com.android.providers.media;
 import static android.Manifest.permission.ACCESS_CACHE_FILESYSTEM;
 import static android.Manifest.permission.INTERACT_ACROSS_USERS;
 import static android.Manifest.permission.READ_EXTERNAL_STORAGE;
-import static android.Manifest.permission.READ_MEDIA_AUDIO;
-import static android.Manifest.permission.READ_MEDIA_IMAGES;
-import static android.Manifest.permission.READ_MEDIA_VIDEO;
 import static android.Manifest.permission.WRITE_EXTERNAL_STORAGE;
-import static android.Manifest.permission.WRITE_MEDIA_AUDIO;
-import static android.Manifest.permission.WRITE_MEDIA_IMAGES;
 import static android.Manifest.permission.WRITE_MEDIA_STORAGE;
-import static android.Manifest.permission.WRITE_MEDIA_VIDEO;
 import static android.content.pm.PackageManager.PERMISSION_GRANTED;
 import static android.os.ParcelFileDescriptor.MODE_WRITE_ONLY;
 import static android.provider.MediaStore.AUTHORITY;
@@ -58,6 +52,7 @@ import android.content.res.Resources;
 import android.database.Cursor;
 import android.database.DatabaseUtils;
 import android.database.MatrixCursor;
+import android.database.TranslatingCursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.database.sqlite.SQLiteQueryBuilder;
@@ -113,7 +108,6 @@ import android.util.Pair;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.os.BackgroundThread;
 import com.android.internal.util.ArrayUtils;
-import com.android.providers.media.TranslatingCursor.Translator;
 
 import libcore.io.IoUtils;
 import libcore.net.MimeUtils;
@@ -704,7 +698,9 @@ public class MediaProvider extends ContentProvider {
                 + "width INTEGER, height INTEGER, title_resource_uri TEXT,"
                 + "owner_package_name TEXT DEFAULT NULL,"
                 + "color_standard INTEGER, color_transfer INTEGER, color_range INTEGER,"
-                + "_hash BLOB DEFAULT NULL, is_pending INTEGER DEFAULT 0)");
+                + "_hash BLOB DEFAULT NULL, is_pending INTEGER DEFAULT 0,"
+                + "is_download INTEGER DEFAULT 0, download_uri TEXT DEFAULT NULL,"
+                + "referer_uri TEXT DEFAULT NULL)");
 
         db.execSQL("CREATE TABLE log (time DATETIME, message TEXT)");
         if (!internal) {
@@ -819,6 +815,10 @@ public class MediaProvider extends ContentProvider {
                 + "isprivate,tags,category,language,mini_thumb_data,latitude,longitude,datetaken,"
                 + "mini_thumb_magic,bucket_id,bucket_display_name,bookmark,width,height,is_drm,"
                 + "owner_package_name,_hash,is_pending FROM files WHERE media_type=3");
+        db.execSQL("CREATE VIEW downloads AS SELECT _id,_data,_size,_display_name,title,date_added,"
+                + "date_modified,mime_type,is_drm,is_pending,NULL as width,NULL as height,"
+                + "owner_package_name,_hash,download_uri,referer_uri"
+                + " FROM files WHERE is_download=1");
     }
 
     private static void updateFromKKSchema(SQLiteDatabase db) {
@@ -881,6 +881,12 @@ public class MediaProvider extends ContentProvider {
         db.execSQL("ALTER TABLE files ADD COLUMN is_pending INTEGER DEFAULT 0;");
     }
 
+    private static void updateAddDownloadInfo(SQLiteDatabase db, boolean internal) {
+        db.execSQL("ALTER TABLE files ADD COLUMN is_download INTEGER DEFAULT 0;");
+        db.execSQL("ALTER TABLE files ADD COLUMN download_uri TEXT DEFAULT NULL;");
+        db.execSQL("ALTER TABLE files ADD COLUMN referer_uri TEXT DEFAULT NULL;");
+    }
+
     static final int VERSION_J = 509;
     static final int VERSION_K = 700;
     static final int VERSION_L = 700;
@@ -918,6 +924,9 @@ public class MediaProvider extends ContentProvider {
             }
             if (fromVersion < 1004) {
                 updateAddHashAndPending(db, internal);
+            }
+            if (fromVersion < 1005) {
+                updateAddDownloadInfo(db, internal);
             }
         }
 
@@ -1266,7 +1275,7 @@ public class MediaProvider extends ContentProvider {
                 && config != null) {
             final int callingPid = Binder.getCallingPid();
             final int callingUid = Binder.getCallingUid();
-            final Translator translator;
+            final TranslatingCursor.Translator translator;
             if (getCallingPackageTargetSdkVersion() >= Build.VERSION_CODES.Q) {
                 translator = (data, id) -> null;
             } else {
@@ -1422,6 +1431,10 @@ public class MediaProvider extends ContentProvider {
                 break;
             case AUDIO_PLAYLISTS:
                 defaultPrimary = Environment.DIRECTORY_MUSIC;
+                allowedPrimary = Arrays.asList(defaultPrimary);
+                break;
+            case DOWNLOADS:
+                defaultPrimary = Environment.DIRECTORY_DOWNLOADS;
                 allowedPrimary = Arrays.asList(defaultPrimary);
                 break;
         }
@@ -2284,6 +2297,8 @@ public class MediaProvider extends ContentProvider {
             // it be whoever is creating the content.
             initialValues.remove(FileColumns.OWNER_PACKAGE_NAME);
 
+            initialValues.remove(FileColumns.IS_DOWNLOAD);
+
             if (isCallingPackageSystem()) {
                 // When media inserted by ourselves, the best we can do is guess
                 // ownership based on path.
@@ -2547,6 +2562,15 @@ public class MediaProvider extends ContentProvider {
                 }
                 break;
 
+            case DOWNLOADS:
+                maybePut(initialValues, FileColumns.OWNER_PACKAGE_NAME, ownerPackageName);
+                initialValues.put(FileColumns.IS_DOWNLOAD, true);
+                rowId = insertFile(helper, match, uri, initialValues,
+                        FileColumns.MEDIA_TYPE_NONE, false, notifyRowIds);
+                newUri = ContentUris.withAppendedId(
+                        MediaStore.Downloads.getContentUri(volumeName), rowId);
+                break;
+
             default:
                 throw new UnsupportedOperationException("Invalid URI " + uri);
         }
@@ -2768,6 +2792,21 @@ public class MediaProvider extends ContentProvider {
     private static final int TYPE_UPDATE = 1;
     private static final int TYPE_DELETE = 2;
 
+    /**
+     * Generate a {@link SQLiteQueryBuilder} that is filtered based on the
+     * runtime permissions and/or {@link Uri} grants held by the caller.
+     * <ul>
+     * <li>If caller holds a {@link Uri} grant, access is allowed according to
+     * that grant.
+     * <li>If caller holds the write permission for a collection, they can
+     * read/write all contents of that collection.
+     * <li>If caller holds the read permission for a collection, they can read
+     * all contents of that collection, but writes are limited to content they
+     * own.
+     * <li>If caller holds no permissions for a collection, all reads/write are
+     * limited to content they own.
+     * </ul>
+     */
     private SQLiteQueryBuilder getQueryBuilder(int type, Uri uri, int match, Bundle queryArgs) {
         final boolean forWrite;
         switch (type) {
@@ -2777,12 +2816,6 @@ public class MediaProvider extends ContentProvider {
             default: throw new IllegalStateException();
         }
 
-        final int permission = checkCallingPermission(uri, match, forWrite);
-        return getQueryBuilder(type, uri, match, queryArgs, permission);
-    }
-
-    private SQLiteQueryBuilder getQueryBuilder(int type, Uri uri, int match, Bundle queryArgs,
-            int permission) {
         final SQLiteQueryBuilder qb = new SQLiteQueryBuilder();
         if (parseBoolean(uri.getQueryParameter("distinct"))) {
             qb.setDistinct(true);
@@ -2791,8 +2824,7 @@ public class MediaProvider extends ContentProvider {
 
         final String callingPackage = getCallingPackageOrSelf();
 
-        final int permissionGrantedTypes = (permission & ~PERMISSION_GRANTED_MASK);
-        permission = permission & PERMISSION_GRANTED_MASK;
+        final boolean allowGlobal = checkCallingPermissionGlobal(uri, forWrite);
 
         boolean includePending = parseBoolean(
                 uri.getQueryParameter(MediaStore.PARAM_INCLUDE_PENDING));
@@ -2814,7 +2846,7 @@ public class MediaProvider extends ContentProvider {
                     appendWhereStandalone(qb, FileColumns.MEDIA_TYPE + "=?",
                             FileColumns.MEDIA_TYPE_IMAGE);
                 }
-                if (permission == PERMISSION_GRANTED_IF_OWNER) {
+                if (!allowGlobal && !checkCallingPermissionImages(forWrite, callingPackage)) {
                     appendWhereStandalone(qb, FileColumns.OWNER_PACKAGE_NAME + "=?",
                             callingPackage);
                 }
@@ -2828,7 +2860,7 @@ public class MediaProvider extends ContentProvider {
                 // fall-through
             case IMAGES_THUMBNAILS:
                 qb.setTables("thumbnails");
-                if (permission == PERMISSION_GRANTED_IF_OWNER) {
+                if (!allowGlobal && !checkCallingPermissionImages(forWrite, callingPackage)) {
                     appendWhereStandalone(qb,
                             "image_id IN (SELECT _id FROM images WHERE owner_package_name=?)",
                             callingPackage);
@@ -2851,7 +2883,7 @@ public class MediaProvider extends ContentProvider {
                     appendWhereStandalone(qb, FileColumns.MEDIA_TYPE + "=?",
                             FileColumns.MEDIA_TYPE_AUDIO);
                 }
-                if (permission == PERMISSION_GRANTED_IF_OWNER) {
+                if (!allowGlobal && !checkCallingPermissionAudio(forWrite, callingPackage)) {
                     appendWhereStandalone(qb, FileColumns.OWNER_PACKAGE_NAME + "=?",
                             callingPackage);
                 }
@@ -2909,7 +2941,7 @@ public class MediaProvider extends ContentProvider {
                     appendWhereStandalone(qb, FileColumns.MEDIA_TYPE + "=?",
                             FileColumns.MEDIA_TYPE_PLAYLIST);
                 }
-                if (permission == PERMISSION_GRANTED_IF_OWNER) {
+                if (!allowGlobal && !checkCallingPermissionAudio(forWrite, callingPackage)) {
                     appendWhereStandalone(qb, FileColumns.OWNER_PACKAGE_NAME + "=?",
                             callingPackage);
                 }
@@ -2996,7 +3028,7 @@ public class MediaProvider extends ContentProvider {
                     appendWhereStandalone(qb, FileColumns.MEDIA_TYPE + "=?",
                             FileColumns.MEDIA_TYPE_VIDEO);
                 }
-                if (permission == PERMISSION_GRANTED_IF_OWNER) {
+                if (!allowGlobal && !checkCallingPermissionVideo(forWrite, callingPackage)) {
                     appendWhereStandalone(qb, FileColumns.OWNER_PACKAGE_NAME + "=?",
                             callingPackage);
                 }
@@ -3010,7 +3042,7 @@ public class MediaProvider extends ContentProvider {
                 // fall-through
             case VIDEO_THUMBNAILS:
                 qb.setTables("videothumbnails");
-                if (permission == PERMISSION_GRANTED_IF_OWNER) {
+                if (!allowGlobal && !checkCallingPermissionVideo(forWrite, callingPackage)) {
                     appendWhereStandalone(qb,
                             "video_id IN (SELECT _id FROM video WHERE owner_package_name=?)",
                             callingPackage);
@@ -3028,21 +3060,21 @@ public class MediaProvider extends ContentProvider {
                 qb.setTables("files");
 
                 final ArrayList<String> options = new ArrayList<>();
-                if (permission == PERMISSION_GRANTED_IF_OWNER) {
+                if (!allowGlobal) {
                     options.add(DatabaseUtils.bindSelection("owner_package_name=?",
                             callingPackage));
-                }
-                if ((permissionGrantedTypes & PERMISSION_GRANTED_TYPE_AUDIO) != 0) {
-                    options.add(DatabaseUtils.bindSelection("media_type=?",
-                            FileColumns.MEDIA_TYPE_AUDIO));
-                }
-                if ((permissionGrantedTypes & PERMISSION_GRANTED_TYPE_VIDEO) != 0) {
-                    options.add(DatabaseUtils.bindSelection("media_type=?",
-                            FileColumns.MEDIA_TYPE_VIDEO));
-                }
-                if ((permissionGrantedTypes & PERMISSION_GRANTED_TYPE_IMAGES) != 0) {
-                    options.add(DatabaseUtils.bindSelection("media_type=?",
-                            FileColumns.MEDIA_TYPE_IMAGE));
+                    if (checkCallingPermissionAudio(forWrite, callingPackage)) {
+                        options.add(DatabaseUtils.bindSelection("media_type=?",
+                                FileColumns.MEDIA_TYPE_AUDIO));
+                    }
+                    if (checkCallingPermissionVideo(forWrite, callingPackage)) {
+                        options.add(DatabaseUtils.bindSelection("media_type=?",
+                                FileColumns.MEDIA_TYPE_VIDEO));
+                    }
+                    if (checkCallingPermissionImages(forWrite, callingPackage)) {
+                        options.add(DatabaseUtils.bindSelection("media_type=?",
+                                FileColumns.MEDIA_TYPE_IMAGE));
+                    }
                 }
                 if (options.size() > 0) {
                     appendWhereStandalone(qb, TextUtils.join(" OR ", options));
@@ -3052,6 +3084,30 @@ public class MediaProvider extends ContentProvider {
                     appendWhereStandalone(qb, FileColumns.IS_PENDING + "=?", 0);
                 }
 
+                break;
+
+            case DOWNLOADS_ID:
+                appendWhereStandalone(qb, "_id=?", uri.getPathSegments().get(2));
+                includePending = true;
+                // fall-through
+            case DOWNLOADS:
+                if (type == TYPE_QUERY) {
+                    qb.setTables("downloads");
+                    if (ENFORCE_PUBLIC_API) {
+                        qb.setProjectionMap(sDownloadsColumns);
+                        qb.setProjectionGreylist(sGreylist);
+                    }
+                } else {
+                    qb.setTables("files");
+                    appendWhereStandalone(qb, FileColumns.IS_DOWNLOAD + "=1");
+                }
+                if (!allowGlobal) {
+                    appendWhereStandalone(qb, FileColumns.OWNER_PACKAGE_NAME + "=?",
+                            callingPackage);
+                }
+                if (!includePending) {
+                    appendWhereStandalone(qb, FileColumns.IS_PENDING + "=?", 0);
+                }
                 break;
 
             default:
@@ -3547,6 +3603,8 @@ public class MediaProvider extends ContentProvider {
             // Remote callers have no direct control over owner column; we force
             // it be whoever is creating the content.
             initialValues.remove(FileColumns.OWNER_PACKAGE_NAME);
+
+            initialValues.remove(FileColumns.IS_DOWNLOAD);
         }
 
         // if the media type is being changed, check if it's being changed from image or video
@@ -4249,151 +4307,83 @@ public class MediaProvider extends ContentProvider {
         }
     }
 
-    /**
-     * Value indicating that permission should only be considered granted for
-     * items that the calling package directly owns.
-     * <p>
-     * This value typically means that a {@link MediaColumns#OWNER_PACKAGE_NAME}
-     * filter should be applied to any database operations.
-     */
-    private static final int PERMISSION_GRANTED_IF_OWNER = 0x00000001;
-
-    /**
-     * Special values indicating that permission should only be considered
-     * granted to non-owned media based on media type.
-     */
-    private static final int PERMISSION_GRANTED_TYPE_AUDIO = 0x00010000;
-    private static final int PERMISSION_GRANTED_TYPE_VIDEO = 0x00020000;
-    private static final int PERMISSION_GRANTED_TYPE_IMAGES = 0x00040000;
-
-    private static final int PERMISSION_GRANTED_MASK = 0x0000ffff;
-
-    /**
-     * Check access that should be allowed for caller, based on grants and/or
-     * runtime permissions they hold.
-     * <ul>
-     * <li>If caller holds a {@link Uri} grant, access is allowed according to
-     * that grant.
-     * <li>If caller holds the write permission for a collection, they can
-     * read/write all contents of that collection.
-     * <li>If caller holds the read permission for a collection, they can read
-     * all contents of that collection, but writes are limited to content they
-     * own.
-     * <li>If caller holds no permissions for a collection, all reads/write are
-     * limited to content they own.
-     * </ul>
-     *
-     * @return one of {@link PackageManager#PERMISSION_DENIED},
-     *         {@link PackageManager#PERMISSION_GRANTED}, or
-     *         {@link #PERMISSION_GRANTED_IF_OWNER}.
-     */
-    private int checkCallingPermission(Uri uri, int match, boolean forWrite) {
+    private boolean checkCallingPermissionGlobal(Uri uri, boolean forWrite) {
         final Context context = getContext();
 
         // Shortcut when using old storage model; everything is allowed
         if (!ENFORCE_ISOLATED_STORAGE) {
-            return PERMISSION_GRANTED;
+            return true;
         }
 
         // System internals can work with all media
         if (isCallingPackageSystem()) {
-            return PERMISSION_GRANTED;
+            return true;
         }
 
         // Outstanding grant means they get access
         if (context.checkCallingUriPermission(uri, forWrite
                 ? Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 : Intent.FLAG_GRANT_READ_URI_PERMISSION) == PERMISSION_GRANTED) {
-            return PERMISSION_GRANTED;
+            return true;
         }
 
-        final String readPermission;
-        final String writePermission;
-        switch (match) {
-            case IMAGES_MEDIA:
-            case IMAGES_MEDIA_ID:
-            case IMAGES_THUMBNAILS:
-            case IMAGES_THUMBNAILS_ID:
-                readPermission = READ_MEDIA_IMAGES;
-                writePermission = WRITE_MEDIA_IMAGES;
-                break;
+        return false;
+    }
 
-            case AUDIO_MEDIA:
-            case AUDIO_MEDIA_ID:
-            case AUDIO_MEDIA_ID_GENRES:
-            case AUDIO_MEDIA_ID_GENRES_ID:
-            case AUDIO_MEDIA_ID_PLAYLISTS:
-            case AUDIO_MEDIA_ID_PLAYLISTS_ID:
-            case AUDIO_GENRES:
-            case AUDIO_GENRES_ID:
-            case AUDIO_GENRES_ID_MEMBERS:
-            case AUDIO_GENRES_ALL_MEMBERS:
-            case AUDIO_PLAYLISTS:
-            case AUDIO_PLAYLISTS_ID:
-            case AUDIO_PLAYLISTS_ID_MEMBERS:
-            case AUDIO_PLAYLISTS_ID_MEMBERS_ID:
-            case AUDIO_ARTISTS:
-            case AUDIO_ARTISTS_ID:
-            case AUDIO_ALBUMS:
-            case AUDIO_ALBUMS_ID:
-            case AUDIO_ARTISTS_ID_ALBUMS:
-            case AUDIO_ALBUMART:
-            case AUDIO_ALBUMART_ID:
-            case AUDIO_ALBUMART_FILE_ID:
-                readPermission = READ_MEDIA_AUDIO;
-                writePermission = WRITE_MEDIA_AUDIO;
-                break;
+    private boolean checkCallingPermission(String readPermission, int readOp, int writeOp,
+            boolean forWrite, String callingPackage) {
+        if (!forWrite
+                && getContext().checkCallingPermission(readPermission) != PERMISSION_GRANTED) {
+            return false;
+        }
 
-            case VIDEO_MEDIA:
-            case VIDEO_MEDIA_ID:
-            case VIDEO_THUMBNAILS:
-            case VIDEO_THUMBNAILS_ID:
-                readPermission = READ_MEDIA_VIDEO;
-                writePermission = WRITE_MEDIA_VIDEO;
-                break;
-
-            case FILES:
-            case FILES_ID:
-                int permission = PERMISSION_GRANTED_IF_OWNER;
-                if (context.checkCallingPermission(
-                        forWrite ? WRITE_MEDIA_AUDIO : READ_MEDIA_AUDIO) == PERMISSION_GRANTED) {
-                    permission |= PERMISSION_GRANTED_TYPE_AUDIO;
-                }
-                if (context.checkCallingPermission(
-                        forWrite ? WRITE_MEDIA_VIDEO : READ_MEDIA_VIDEO) == PERMISSION_GRANTED) {
-                    permission |= PERMISSION_GRANTED_TYPE_VIDEO;
-                }
-                if (context.checkCallingPermission(
-                        forWrite ? WRITE_MEDIA_IMAGES : READ_MEDIA_IMAGES) == PERMISSION_GRANTED) {
-                    permission |= PERMISSION_GRANTED_TYPE_IMAGES;
-                }
-                return permission;
-
+        final int op = forWrite ? writeOp : readOp;
+        final int mode = mAppOpsManager.noteProxyOpNoThrow(op, callingPackage);
+        switch (mode) {
+            case AppOpsManager.MODE_ALLOWED:
+                return true;
+            case AppOpsManager.MODE_DEFAULT:
+            case AppOpsManager.MODE_IGNORED:
+            case AppOpsManager.MODE_ERRORED:
+                // TODO: throw SecurityException once we have APIs for
+                // developers to request access to media they don't own
+                return false;
             default:
-                return PERMISSION_GRANTED_IF_OWNER;
+                throw new IllegalStateException(AppOpsManager.opToName(op) + " has unknown mode "
+                        + AppOpsManager.modeToName(mode));
         }
+    }
 
-        if (context.checkCallingPermission(
-                forWrite ? writePermission : readPermission) == PERMISSION_GRANTED) {
-            return PERMISSION_GRANTED;
-        }
+    private boolean checkCallingPermissionAudio(boolean forWrite, String callingPackage) {
+        return checkCallingPermission(android.Manifest.permission.READ_MEDIA_AUDIO,
+                AppOpsManager.OP_READ_MEDIA_AUDIO,
+                AppOpsManager.OP_WRITE_MEDIA_AUDIO,
+                forWrite, callingPackage);
+    }
 
-        // Worst case, apps can always work with content they own
-        return PERMISSION_GRANTED_IF_OWNER;
+    private boolean checkCallingPermissionVideo(boolean forWrite, String callingPackage) {
+        return checkCallingPermission(android.Manifest.permission.READ_MEDIA_VIDEO,
+                AppOpsManager.OP_READ_MEDIA_VIDEO,
+                AppOpsManager.OP_WRITE_MEDIA_VIDEO,
+                forWrite, callingPackage);
+    }
+
+    private boolean checkCallingPermissionImages(boolean forWrite, String callingPackage) {
+        return checkCallingPermission(android.Manifest.permission.READ_MEDIA_IMAGES,
+                AppOpsManager.OP_READ_MEDIA_IMAGES,
+                AppOpsManager.OP_WRITE_MEDIA_IMAGES,
+                forWrite, callingPackage);
     }
 
     /**
-     * Enforce that caller has access to the given {@link Uri}, as determined by
-     * {@link #checkCallingPermission(Uri, int, boolean)}.
+     * Enforce that caller has access to the given {@link Uri}.
      *
      * @throws SecurityException if access isn't allowed.
      */
     private void enforceCallingPermission(Uri uri, boolean forWrite) {
-        final boolean allowHidden = isCallingPackageAllowedHidden();
-        final int match = matchUri(uri, allowHidden);
-
-        final int permission = checkCallingPermission(uri, match, forWrite);
-        if (permission == PERMISSION_GRANTED) {
+        // Try a simple global check first before falling back to performing a
+        // simple query to probe for access.
+        if (checkCallingPermissionGlobal(uri, forWrite)) {
             // Access allowed, yay!
             return;
         } else {
@@ -5332,6 +5322,9 @@ public class MediaProvider extends ContentProvider {
     // Used only to invoke special logic for directories
     private static final int FILES_DIRECTORY = 706;
 
+    private static final int DOWNLOADS = 800;
+    private static final int DOWNLOADS_ID = 801;
+
     private static final UriMatcher HIDDEN_URI_MATCHER =
             new UriMatcher(UriMatcher.NO_MATCH);
 
@@ -5439,12 +5432,16 @@ public class MediaProvider extends ContentProvider {
 
         // Used only to trigger special logic for directories
         hiddenMatcher.addURI(AUTHORITY, "*/dir", FILES_DIRECTORY);
+
+        publicMatcher.addURI(AUTHORITY, "*/downloads", DOWNLOADS);
+        publicMatcher.addURI(AUTHORITY, "*/downloads/#", DOWNLOADS_ID);
     }
 
     private static final ArrayMap<String, String> sMediaColumns = new ArrayMap<>();
     private static final ArrayMap<String, String> sAudioColumns = new ArrayMap<>();
     private static final ArrayMap<String, String> sImagesColumns = new ArrayMap<>();
     private static final ArrayMap<String, String> sVideoColumns = new ArrayMap<>();
+    private static final ArrayMap<String, String> sDownloadsColumns = new ArrayMap<>();
 
     private static final ArrayMap<String, String> sArtistAlbumsMap = new ArrayMap<>();
     private static final ArrayMap<String, String> sPlaylistMembersMap = new ArrayMap<>();
@@ -5569,6 +5566,13 @@ public class MediaProvider extends ContentProvider {
         map.remove(MediaStore.MediaColumns.HEIGHT);
     }
 
+    {
+        final Map<String, String> map = sDownloadsColumns;
+        map.putAll(sMediaColumns);
+        addMapping(map, MediaStore.Downloads.DOWNLOAD_URI);
+        addMapping(map, MediaStore.Downloads.REFERER_URI);
+    }
+
     /**
      * List of abusive custom columns that we're willing to allow via
      * {@link SQLiteQueryBuilder#setProjectionGreylist(List)}.
@@ -5576,10 +5580,11 @@ public class MediaProvider extends ContentProvider {
     static final ArrayList<Pattern> sGreylist = new ArrayList<>();
 
     {
+        final String maybeAs = "( (as )?[_a-z0-9]+)?";
         sGreylist.add(Pattern.compile(
-                "(?i)[_a-z0-9]+ as [_a-z0-9]+"));
+                "(?i)[_a-z0-9]+" + maybeAs));
         sGreylist.add(Pattern.compile(
-                "(?i)(min|max|sum|avg|total|count)\\(([_a-z0-9]+|\\*)\\)( as [_a-z0-9]+)?"));
+                "(?i)(min|max|sum|avg|total|count|cast)\\(([_a-z0-9]+" + maybeAs + "|\\*)\\)" + maybeAs));
         sGreylist.add(Pattern.compile(
                 "case when case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added \\* \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added / \\d+ else \\d+ end > case when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified \\* \\d+ when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified / \\d+ else \\d+ end then case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added \\* \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added / \\d+ else \\d+ end else case when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified \\* \\d+ when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified / \\d+ else \\d+ end end as corrected_added_modified"));
         sGreylist.add(Pattern.compile(
