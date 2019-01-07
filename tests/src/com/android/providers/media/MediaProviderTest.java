@@ -16,6 +16,8 @@
 
 package com.android.providers.media;
 
+import static android.provider.MediaStore.Downloads.isDownload;
+import static android.provider.MediaStore.Downloads.isDownloadDir;
 import static android.provider.MediaStore.PARAM_PRIMARY;
 import static android.provider.MediaStore.PARAM_SECONDARY;
 
@@ -26,6 +28,7 @@ import static com.android.providers.media.MediaProvider.recoverAbusiveGroupBy;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -33,9 +36,11 @@ import android.content.ContentValues;
 import android.net.Uri;
 import android.os.Environment;
 import android.provider.MediaStore;
+import android.provider.MediaStore.Images.ImageColumns;
 import android.provider.MediaStore.MediaColumns;
-import android.support.test.runner.AndroidJUnit4;
 import android.util.Pair;
+
+import androidx.test.runner.AndroidJUnit4;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -336,6 +341,82 @@ public class MediaProviderTest {
                 "CAST(_id AS TEXT) AS string_id"));
         assertTrue(isGreylistMatch(
                 "cast(_id as text)"));
+    }
+
+    @Test
+    public void testIsDownload() throws Exception {
+        assertTrue(isDownload("/storage/emulated/0/Download/colors.png"));
+        assertTrue(isDownload("/storage/emulated/0/Download/test.pdf"));
+        assertTrue(isDownload("/storage/emulated/0/Download/dir/foo.mp4"));
+        assertTrue(isDownload("/storage/0000-0000/Download/foo.txt"));
+        assertTrue(isDownload(
+                "/storage/emulated/0/Android/sandbox/com.example/Download/colors.png"));
+        assertTrue(isDownload(
+                "/storage/emulated/0/Android/sandbox/shared-com.uid.shared/Download/colors.png"));
+        assertTrue(isDownload(
+                "/storage/0000-0000/Android/sandbox/com.example/Download/colors.png"));
+        assertTrue(isDownload(
+                "/storage/0000-0000/Android/sandbox/shared-com.uid.shared/Download/colors.png"));
+
+
+        assertFalse(isDownload("/storage/emulated/0/Pictures/colors.png"));
+        assertFalse(isDownload("/storage/emulated/0/Pictures/Download/colors.png"));
+        assertFalse(isDownload("/storage/emulated/0/Android/data/com.example/Download/foo.txt"));
+        assertFalse(isDownload(
+                "/storage/emulated/0/Android/sandbox/com.example/dir/Download/foo.txt"));
+        assertFalse(isDownload("/storage/emulated/0/Download"));
+        assertFalse(isDownload("/storage/emulated/0/Android/sandbox/com.example/Download"));
+        assertFalse(isDownload(
+                "/storage/0000-0000/Android/sandbox/shared-com.uid.shared/Download"));
+    }
+
+    @Test
+    public void testIsDownloadDir() throws Exception {
+        assertTrue(isDownloadDir("/storage/emulated/0/Download"));
+        assertTrue(isDownloadDir("/storage/emulated/0/Android/sandbox/com.example/Download"));
+
+        assertFalse(isDownloadDir("/storage/emulated/0/Download/colors.png"));
+        assertFalse(isDownloadDir("/storage/emulated/0/Download/dir/"));
+        assertFalse(isDownloadDir(
+                "/storage/emulated/0/Android/sandbox/com.example/Download/dir/foo.txt"));
+    }
+
+    @Test
+    public void testComputeBucketValues() throws Exception {
+        assertComputeBucketValues("/DCIM/Camera/IMG1024.JPG",
+                "/dcim/camera", "Camera", "img1024");
+        assertComputeBucketValues("/DCIM/Camera/IMG1024.CR2",
+                "/dcim/camera", "Camera", "img1024");
+        assertComputeBucketValues("/DCIM/Camera/IMG1024.HDR.JPG",
+                "/dcim/camera", "Camera", "img1024");
+
+        assertComputeBucketValues("/DCIM/Camera/IMG1024",
+                "/dcim/camera", "Camera", null);
+        assertComputeBucketValues("/DCIM/Camera/.foo",
+                "/dcim/camera", "Camera", null);
+
+        assertComputeBucketValues("foo",
+                null, null, null);
+    }
+
+    private static void assertComputeBucketValues(String data, String bucketId,
+            String bucketDisplayName, String secondaryBucketId) {
+        final ContentValues values = new ContentValues();
+        values.put(MediaColumns.DATA, data);
+        MediaProvider.computeBucketValues(values);
+        if (bucketId != null) {
+            assertEquals(bucketId.hashCode(), (long) values.getAsLong(ImageColumns.BUCKET_ID));
+            assertEquals(bucketDisplayName, values.getAsString(ImageColumns.BUCKET_DISPLAY_NAME));
+        } else {
+            assertNull(values.get(ImageColumns.BUCKET_ID));
+            assertNull(values.get(ImageColumns.BUCKET_DISPLAY_NAME));
+        }
+        if (secondaryBucketId != null) {
+            assertEquals(secondaryBucketId.hashCode(),
+                    (long) values.getAsLong(ImageColumns.SECONDARY_BUCKET_ID));
+        } else {
+            assertNull(values.get(ImageColumns.SECONDARY_BUCKET_ID));
+        }
     }
 
     private static boolean isGreylistMatch(String raw) {
