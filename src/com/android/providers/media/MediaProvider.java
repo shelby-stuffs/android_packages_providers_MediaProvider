@@ -1522,7 +1522,7 @@ public class MediaProvider extends ContentProvider {
 
     @VisibleForTesting
     static void ensureFileColumns(Uri uri, ContentValues values) {
-        ensureUniqueFileColumns(matchUri(uri, true), uri, values);
+        ensureNonUniqueFileColumns(matchUri(uri, true), uri, values);
     }
 
     private static void ensureUniqueFileColumns(int match, Uri uri, ContentValues values) {
@@ -1661,18 +1661,12 @@ public class MediaProvider extends ContentProvider {
         // Generate path when undefined
         if (TextUtils.isEmpty(values.getAsString(MediaColumns.DATA))) {
             // Check for shady looking paths
-            final String displayName = values.getAsString(MediaColumns.DISPLAY_NAME);
-            final String primary = values.getAsString(MediaColumns.PRIMARY_DIRECTORY);
-            final String secondary = values.getAsString(MediaColumns.SECONDARY_DIRECTORY);
-            if (displayName.contains("/")) {
-                throw new IllegalArgumentException("Directories not allowed: " + displayName);
-            }
-            if (primary != null && primary.contains("/")) {
-                throw new IllegalArgumentException("Directories not allowed: " + primary);
-            }
-            if (secondary != null && secondary.contains("/")) {
-                throw new IllegalArgumentException("Directories not allowed: " + secondary);
-            }
+            final String displayName = sanitizeName(
+                    values.getAsString(MediaColumns.DISPLAY_NAME));
+            final String primary = sanitizeName(
+                    values.getAsString(MediaColumns.PRIMARY_DIRECTORY));
+            final String secondary = sanitizeName(
+                    values.getAsString(MediaColumns.SECONDARY_DIRECTORY));
 
             // Require content live under specific directories
             if (primary != null) {
@@ -1729,6 +1723,18 @@ public class MediaProvider extends ContentProvider {
                 values.remove(MediaColumns.DISPLAY_NAME);
                 values.remove(MediaColumns.MIME_TYPE);
                 break;
+        }
+    }
+
+    private static @Nullable String sanitizeName(@Nullable String name) {
+        if (name == null) {
+            return null;
+        } else if (name.indexOf('/') >= 0) {
+            throw new IllegalArgumentException("Directory paths not allowed: " + name);
+        } else if (name.startsWith(".")) {
+            throw new IllegalArgumentException("Hidden files not allowed: " + name);
+        } else {
+            return FileUtils.buildValidFatFilename(name);
         }
     }
 
@@ -3157,8 +3163,13 @@ public class MediaProvider extends ContentProvider {
                             FileColumns.MEDIA_TYPE_AUDIO);
                 }
                 if (!allowGlobal && !checkCallingPermissionAudio(forWrite, callingPackage)) {
-                    appendWhereStandalone(qb, FileColumns.OWNER_PACKAGE_NAME + "=?",
-                            callingPackage);
+                    // Apps without Audio permission can only see their own
+                    // media, but we also let them see ringtone-style media to
+                    // support legacy use-cases.
+                    appendWhereStandalone(qb,
+                            DatabaseUtils.bindSelection(FileColumns.OWNER_PACKAGE_NAME
+                                    + "=? OR is_ringtone=1 OR is_alarm=1 OR is_notification=1",
+                                    callingPackage));
                 }
                 if (!includePending) {
                     appendWhereStandalone(qb, FileColumns.IS_PENDING + "=?", 0);
@@ -3432,14 +3443,17 @@ public class MediaProvider extends ContentProvider {
                                 FileColumns.MEDIA_TYPE_AUDIO));
                         options.add(DatabaseUtils.bindSelection("media_type=?",
                                 FileColumns.MEDIA_TYPE_PLAYLIST));
+                        options.add("media_type=0 AND mime_type LIKE 'audio/%'");
                     }
                     if (checkCallingPermissionVideo(forWrite, callingPackage)) {
                         options.add(DatabaseUtils.bindSelection("media_type=?",
                                 FileColumns.MEDIA_TYPE_VIDEO));
+                        options.add("media_type=0 AND mime_type LIKE 'video/%'");
                     }
                     if (checkCallingPermissionImages(forWrite, callingPackage)) {
                         options.add(DatabaseUtils.bindSelection("media_type=?",
                                 FileColumns.MEDIA_TYPE_IMAGE));
+                        options.add("media_type=0 AND mime_type LIKE 'image/%'");
                     }
                 }
                 if (options.size() > 0) {
@@ -3494,8 +3508,9 @@ public class MediaProvider extends ContentProvider {
 
             // If caller is an older app, we're willing to let through a
             // greylist of technically invalid columns
-            // TODO: switch to only set for legacy apps
-            qb.setProjectionGreylist(sGreylist);
+            if (getCallingPackageTargetSdkVersion() < Build.VERSION_CODES.Q) {
+                qb.setProjectionGreylist(sGreylist);
+            }
         }
 
         return qb;
@@ -3680,9 +3695,13 @@ public class MediaProvider extends ContentProvider {
                             // Only need to inform DownloadProvider about the downloads deleted on
                             // external volume.
                             if (MediaStore.VOLUME_EXTERNAL.equals(volumeName) && isDownload == 1) {
-                                deletedDownloadIds.put(id,
-                                        format == MtpConstants.FORMAT_ASSOCIATION ?
-                                                DocumentsContract.Document.MIME_TYPE_DIR : mimeType);
+                                String inferredMimeType;
+                                if (mimeType == null || format == MtpConstants.FORMAT_ASSOCIATION) {
+                                    inferredMimeType = DocumentsContract.Document.MIME_TYPE_DIR;
+                                } else {
+                                    inferredMimeType = mimeType;
+                                }
+                                deletedDownloadIds.put(id, inferredMimeType);
                             }
                             if (mediaType == FileColumns.MEDIA_TYPE_IMAGE) {
                                 deleteIfAllowed(uri, data);
@@ -4902,14 +4921,17 @@ public class MediaProvider extends ContentProvider {
         if (c == null) {
             throw new FileNotFoundException("Missing cursor for " + uri);
         } else if (c.getCount() < 1) {
+            IoUtils.closeQuietly(c);
             throw new FileNotFoundException("No item at " + uri);
         } else if (c.getCount() > 1) {
+            IoUtils.closeQuietly(c);
             throw new FileNotFoundException("Multiple items at " + uri);
         }
 
         if (c.moveToFirst()) {
             return c;
         } else {
+            IoUtils.closeQuietly(c);
             throw new FileNotFoundException("Failed to read row from " + uri);
         }
     }
