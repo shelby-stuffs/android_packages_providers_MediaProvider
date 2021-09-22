@@ -228,7 +228,6 @@ public final class MediaStore {
     public static final String EXTRA_CONTENT_VALUES = "content_values";
     /** {@hide} */
     public static final String EXTRA_RESULT = "result";
-
     /** {@hide} */
     public static final String EXTRA_FILE_DESCRIPTOR = "file_descriptor";
 
@@ -238,6 +237,18 @@ public final class MediaStore {
     public static final String EXTRA_IS_SYSTEM_GALLERY_UID = "is_system_gallery_uid";
     /** {@hide} */
     public static final String EXTRA_IS_SYSTEM_GALLERY_RESPONSE = "is_system_gallery_response";
+
+    /** {@hide} */
+    public static final String SYNC_PROVIDERS_CALL = "sync_providers";
+    /** {@hide} */
+    public static final String SET_CLOUD_PROVIDER_CALL = "set_cloud_provider";
+
+    /** {@hide} */
+    public static final String QUERY_ARG_LIMIT = ContentResolver.QUERY_ARG_LIMIT;
+    /** {@hide} */
+    public static final String QUERY_ARG_MIME_TYPE = "android:query-arg-mime_type";
+    /** {@hide} */
+    public static final String QUERY_ARG_SIZE_BYTES = "android:query-arg-size_bytes";
 
     /**
      * This is for internal use by the media scanner only.
@@ -632,6 +643,57 @@ public final class MediaStore {
      * store the requested image or video.
      */
     public final static String EXTRA_OUTPUT = "output";
+
+    /**
+     * Activity Action: Allow the user to select images or videos provided by
+     * system and return it. This is different than {@link Intent#ACTION_PICK}
+     * and {@link Intent#ACTION_GET_CONTENT} in that
+     * <ul>
+     * <li> the data for this action is provided by system
+     * <li> this action is only used for picking images and videos
+     * <li> caller gets read access to user picked items even without storage
+     * permissions
+     * </ul>
+     * <p>
+     * Callers can optionally specify MIME type (such as {@code image/*} or
+     * {@code video/*}), resulting in a range of content selection that the
+     * caller is interested in. The optional MIME type can be requested with
+     * {@link Intent#setType(String)}.
+     * <p>
+     * If the caller needs multiple returned items (or caller wants to allow
+     * multiple selection), then it can specify
+     * {@link Intent#EXTRA_ALLOW_MULTIPLE} to indicate this. When multiple
+     * selection is enabled, callers can also constrain number of selection
+     * using {@link MediaStore#EXTRA_PICK_IMAGES_MIN} and
+     * {@link MediaStore#EXTRA_PICK_IMAGES_MAX}.
+     * When there is no constraint on number of items, all of the user selected
+     * items are returned. TODO(b/185782624): Add constraint on maximum items
+     * picker can return.
+     * <p>
+     * Output: MediaStore content URI(s) of the item(s) that was picked.
+     */
+    @SdkConstant(SdkConstantType.ACTIVITY_INTENT_ACTION)
+    public static final String ACTION_PICK_IMAGES = "android.provider.action.PICK_IMAGES";
+
+    /**
+     * The name of an optional intent-extra used to constrain minimum number of
+     * items that should be returned by {@link MediaStore#ACTION_PICK_IMAGES},
+     * action may still return nothing (0 items) if the user chooses to cancel.
+     * The value of this intext-extra should be a non-negative integer less than
+     * or equal to {@link MediaStore#EXTRA_PICK_IMAGES_MAX}, the value is
+     * ignored otherwise.
+     */
+    public final static String EXTRA_PICK_IMAGES_MIN = "android.provider.extra.PICK_IMAGES_MIN";
+
+    /**
+     * The name of an optional intent-extra used to constrain maximum number of
+     * items that can be returned by {@link MediaStore#ACTION_PICK_IMAGES},
+     * action may still return nothing (0 items) if the user chooses to cancel.
+     * The value of this intext-extra should be a non-negative integer greater
+     * than or equal to {@link MediaStore#EXTRA_PICK_IMAGES_MIN}, the value
+     * is ignored otherwise.
+     */
+    public final static String EXTRA_PICK_IMAGES_MAX = "android.provider.extra.PICK_IMAGES_MAX";
 
     /**
      * Specify that the caller wants to receive the original media format without transcoding.
@@ -1175,11 +1237,7 @@ public final class MediaStore {
          * {@link ContentResolver#openFileDescriptor(Uri, String)} API is recommended for better
          * performance.
          *
-         * @deprecated Apps that target {@link android.os.Build.VERSION_CODES#R R} and higher
-         *             may not update the value of this column. However they may read the file path
-         *             value from this column and use in file operations.
          */
-        @Deprecated
         @Column(Cursor.FIELD_TYPE_STRING)
         public static final String DATA = "_data";
 
@@ -2615,12 +2673,7 @@ public final class MediaStore {
              *
              * As of {@link android.os.Build.VERSION_CODES#Q}, this thumbnail
              * has correct rotation, don't need to rotate it again.
-             *
-             * @deprecated Apps that target {@link android.os.Build.VERSION_CODES#R R} and higher
-             *             may not update the value of this column. However they may read the file
-             *             path value from this column and use in file operations.
              */
-            @Deprecated
             @Column(Cursor.FIELD_TYPE_STRING)
             public static final String DATA = "_data";
 
@@ -3172,12 +3225,7 @@ public final class MediaStore {
 
             /**
              * Path to the playlist file on disk.
-             *
-             * @deprecated Apps that target {@link android.os.Build.VERSION_CODES#R R} and higher
-             *             may not update the value of this column. However they may read the file
-             *             path value from this column and use in file operations.
              */
-            @Deprecated
             @Column(Cursor.FIELD_TYPE_STRING)
             public static final String DATA = "_data";
 
@@ -3590,12 +3638,7 @@ public final class MediaStore {
         public static class Thumbnails implements BaseColumns {
             /**
              * Path to the thumbnail file on disk.
-             *
-             * @deprecated Apps that target {@link android.os.Build.VERSION_CODES#R R} and higher
-             *             may not update the value of this column. However they may read the file
-             *             path value from this column and use in file operations.
              */
-            @Deprecated
             @Column(Cursor.FIELD_TYPE_STRING)
             public static final String DATA = "_data";
 
@@ -3927,12 +3970,7 @@ public final class MediaStore {
 
             /**
              * Path to the thumbnail file on disk.
-             *
-             * @deprecated Apps that target {@link android.os.Build.VERSION_CODES#R R} and higher
-             *             may not update the value of this column. However they may read the file
-             *             path value from this column and use in file operations.
              */
-            @Deprecated
             @Column(Cursor.FIELD_TYPE_STRING)
             public static final String DATA = "_data";
 

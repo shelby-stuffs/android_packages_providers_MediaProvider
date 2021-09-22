@@ -23,9 +23,6 @@ import static android.app.PendingIntent.FLAG_IMMUTABLE;
 import static android.app.PendingIntent.FLAG_ONE_SHOT;
 import static android.content.ContentResolver.QUERY_ARG_SQL_SELECTION;
 import static android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS;
-import static android.content.pm.PackageManager.MATCH_ANY_USER;
-import static android.content.pm.PackageManager.MATCH_DIRECT_BOOT_AWARE;
-import static android.content.pm.PackageManager.MATCH_DIRECT_BOOT_UNAWARE;
 import static android.content.pm.PackageManager.PERMISSION_GRANTED;
 import static android.database.Cursor.FIELD_TYPE_BLOB;
 import static android.provider.MediaStore.MATCH_DEFAULT;
@@ -85,6 +82,7 @@ import static com.android.providers.media.util.FileUtils.sanitizePath;
 import static com.android.providers.media.util.Logging.LOGV;
 import static com.android.providers.media.util.Logging.TAG;
 
+import android.annotation.IntDef;
 import android.app.AppOpsManager;
 import android.app.AppOpsManager.OnOpActiveChangedListener;
 import android.app.AppOpsManager.OnOpChangedListener;
@@ -198,6 +196,9 @@ import com.android.providers.media.DatabaseHelper.OnLegacyMigrationListener;
 import com.android.providers.media.fuse.ExternalStorageServiceImpl;
 import com.android.providers.media.fuse.FuseDaemon;
 import com.android.providers.media.metrics.PulledMetrics;
+import com.android.providers.media.photopicker.PickerSyncController;
+import com.android.providers.media.photopicker.data.ExternalDbFacade;
+import com.android.providers.media.photopicker.data.PickerDbFacade;
 import com.android.providers.media.playlist.Playlist;
 import com.android.providers.media.scan.MediaScanner;
 import com.android.providers.media.scan.ModernMediaScanner;
@@ -212,6 +213,7 @@ import com.android.providers.media.util.LongArray;
 import com.android.providers.media.util.Metrics;
 import com.android.providers.media.util.MimeUtils;
 import com.android.providers.media.util.PermissionUtils;
+import com.android.providers.media.util.Preconditions;
 import com.android.providers.media.util.SQLiteQueryBuilder;
 import com.android.providers.media.util.UserCache;
 import com.android.providers.media.util.XmpInterface;
@@ -226,6 +228,8 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintWriter;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
@@ -453,6 +457,7 @@ public class MediaProvider extends ContentProvider {
     private PackageManager mPackageManager;
     private DevicePolicyManager mDevicePolicyManager;
     private UserManager mUserManager;
+    private PickerUriResolver mPickerUriResolver;
 
     private UserCache mUserCache;
     private VolumeCache mVolumeCache;
@@ -493,9 +498,6 @@ public class MediaProvider extends ContentProvider {
 
     private OnOpChangedListener mModeListener =
             (op, packageName) -> invalidateLocalCallingIdentityCache(packageName, "op " + op);
-
-    @GuardedBy("mNonWorkProfileUsers")
-    private final List<Integer> mNonWorkProfileUsers = new ArrayList<>();
 
     /**
      * Retrieves a cached calling identity or creates a new one. Also, always sets the app-op
@@ -662,7 +664,7 @@ public class MediaProvider extends ContentProvider {
     private final OnFilesChangeListener mFilesListener = new OnFilesChangeListener() {
         @Override
         public void onInsert(@NonNull DatabaseHelper helper, @NonNull String volumeName, long id,
-                int mediaType, boolean isDownload) {
+                int mediaType, boolean isDownload, boolean isPending) {
             handleInsertedRowForFuse(id);
             acceptWithExpansion(helper::notifyInsert, volumeName, id, mediaType, isDownload);
 
@@ -675,6 +677,10 @@ public class MediaProvider extends ContentProvider {
 
                 // Tell our SAF provider so it knows when views are no longer empty
                 MediaDocumentsProvider.onMediaStoreInsert(getContext(), volumeName, mediaType, id);
+
+                if (mExternalDbFacade.onFileInserted(mediaType, isPending)) {
+                    mPickerSyncController.notifyMediaEvent();
+                }
             });
         }
 
@@ -682,6 +688,8 @@ public class MediaProvider extends ContentProvider {
         public void onUpdate(@NonNull DatabaseHelper helper, @NonNull String volumeName,
                 long oldId, int oldMediaType, boolean oldIsDownload,
                 long newId, int newMediaType, boolean newIsDownload,
+                boolean oldIsTrashed, boolean newIsTrashed,
+                boolean oldIsPending, boolean newIsPending,
                 String oldOwnerPackage, String newOwnerPackage, String oldPath) {
             final boolean isDownload = oldIsDownload || newIsDownload;
             final Uri fileUri = MediaStore.Files.getContentUri(volumeName, oldId);
@@ -693,6 +701,11 @@ public class MediaProvider extends ContentProvider {
                 if (helper.isExternal()) {
                     // Update the quota type on the filesystem
                     updateQuotaTypeForUri(fileUri, newMediaType);
+                }
+
+                if (mExternalDbFacade.onFileUpdated(oldId, oldMediaType, newMediaType, oldIsTrashed,
+                                newIsTrashed, oldIsPending, newIsPending)) {
+                    mPickerSyncController.notifyMediaEvent();
                 }
             });
 
@@ -714,7 +727,6 @@ public class MediaProvider extends ContentProvider {
             acceptWithExpansion(helper::notifyDelete, volumeName, id, mediaType, isDownload);
             // Remove cached transcoded file if any
             mTranscodeHelper.deleteCachedTranscodeFile(id);
-
 
             helper.postBackground(() -> {
                 // Item no longer exists, so revoke all access to it
@@ -740,6 +752,10 @@ public class MediaProvider extends ContentProvider {
 
                 // Tell our SAF provider so it can revoke too
                 MediaDocumentsProvider.onMediaStoreDelete(getContext(), volumeName, mediaType, id);
+
+                if (mExternalDbFacade.onFileDeleted(id, mediaType)) {
+                    mPickerSyncController.notifyMediaEvent();
+                }
             });
         }
     };
@@ -915,6 +931,7 @@ public class MediaProvider extends ContentProvider {
         mDevicePolicyManager = context.getSystemService(DevicePolicyManager.class);
         mUserManager = context.getSystemService(UserManager.class);
         mVolumeCache = new VolumeCache(context, mUserCache);
+        mPickerUriResolver = new PickerUriResolver(context);
 
         // Reasonable thumbnail size is half of the smallest screen edge width
         final DisplayMetrics metrics = context.getResources().getDisplayMetrics();
@@ -923,12 +940,15 @@ public class MediaProvider extends ContentProvider {
 
         mMediaScanner = new ModernMediaScanner(context);
 
-        mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME,
-                true, false, false, Column.class,
-                Metrics::logSchemaChange, mFilesListener, MIGRATION_LISTENER, mIdGenerator);
-        mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME,
-                false, false, false, Column.class,
-                Metrics::logSchemaChange, mFilesListener, MIGRATION_LISTENER, mIdGenerator);
+        mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME, false, false,
+                Column.class, Metrics::logSchemaChange, mFilesListener, MIGRATION_LISTENER,
+                mIdGenerator);
+        mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME, false, false,
+                Column.class, Metrics::logSchemaChange, mFilesListener, MIGRATION_LISTENER,
+                mIdGenerator);
+        mExternalDbFacade = new ExternalDbFacade(mExternalDatabase);
+        mPickerDbFacade = new PickerDbFacade(context);
+        mPickerSyncController = new PickerSyncController(context, mPickerDbFacade);
 
         if (SdkLevel.isAtLeastS()) {
             mTranscodeHelper = new TranscodeHelperImpl(context, this);
@@ -1372,7 +1392,7 @@ public class MediaProvider extends ContentProvider {
             return false;
         }
 
-        if (isWorkProfile(callingUserId) || isWorkProfile(pathUserId)) {
+        if (mUserCache.isWorkProfile(callingUserId) || mUserCache.isWorkProfile(pathUserId)) {
             // Cross-user lookup not allowed if one user in the pair has a profile owner app
             Log.w(TAG, "CrossUser work profile check failed. Users: " + callingUserId + " and "
                     + pathUserId);
@@ -1388,33 +1408,6 @@ public class MediaProvider extends ContentProvider {
         }
 
         return result;
-    }
-
-    private boolean isWorkProfile(int userId) {
-        synchronized (mNonWorkProfileUsers) {
-            if (mNonWorkProfileUsers.contains(userId)) {
-                return false;
-            }
-            if (userId == 0) {
-                mNonWorkProfileUsers.add(userId);
-                // user 0 cannot have a profile owner
-                return false;
-            }
-        }
-
-        List<Integer> uids = new ArrayList<>();
-        for (ApplicationInfo ai : mPackageManager.getInstalledApplications(MATCH_DIRECT_BOOT_AWARE
-                        | MATCH_DIRECT_BOOT_UNAWARE | MATCH_ANY_USER)) {
-            if (((ai.uid / PER_USER_RANGE) == userId)
-                    && mDevicePolicyManager.isProfileOwnerApp(ai.packageName)) {
-                return true;
-            }
-        }
-
-        synchronized (mNonWorkProfileUsers) {
-            mNonWorkProfileUsers.add(userId);
-            return false;
-        }
     }
 
     /**
@@ -2426,9 +2419,8 @@ public class MediaProvider extends ContentProvider {
             final String newMimeType = MimeUtils.resolveMimeType(new File(newPath));
             final String oldMimeType = MimeUtils.resolveMimeType(new File(oldPath));
             final boolean isSameMimeType = newMimeType.equalsIgnoreCase(oldMimeType);
-            final ContentValues contentValues = getContentValuesForFuseRename(newPath, newMimeType,
+            ContentValues contentValues = getContentValuesForFuseRename(newPath, newMimeType,
                     wasHidden, isHidden, isSameMimeType);
-
             if (!updateDatabaseForFuseRename(helper, oldPath, newPath, contentValues)) {
                 if (!bypassRestrictions) {
                     // Check for other URI format grants for oldPath only. Check right before
@@ -2621,13 +2613,22 @@ public class MediaProvider extends ContentProvider {
         final LocalCallingIdentity token = clearLocalCallingIdentity(
                 LocalCallingIdentity.fromExternal(getContext(), mUserCache, uid));
 
-        if(isRedactedUri(uri)) {
-            if((modeFlags & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0) {
+        if (isRedactedUri(uri)) {
+            if ((modeFlags & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0) {
                 // we don't allow write grants on redacted uris.
                 return PackageManager.PERMISSION_DENIED;
             }
 
             uri = getUriForRedactedUri(uri);
+        }
+
+        if (isPickerUri(uri)) {
+            // Do not allow implicit access (by the virtue of ownership/permission) to picker uris.
+            // Picker uris should have explicit permission grants.
+            // If the calling app A has an explicit grant on picker uri, UriGrantsManagerService
+            // will check the grant status and allow app A to grant the uri to app B (without
+            // calling into MediaProvider)
+            return PackageManager.PERMISSION_DENIED;
         }
 
         try {
@@ -2642,13 +2643,10 @@ public class MediaProvider extends ContentProvider {
             }
 
             final int type;
-            final boolean forWrite;
             if ((modeFlags & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0) {
                 type = TYPE_UPDATE;
-                forWrite = true;
             } else {
                 type = TYPE_QUERY;
-                forWrite = false;
             }
 
             final SQLiteQueryBuilder qb = getQueryBuilder(type, table, uri, Bundle.EMPTY, null);
@@ -2708,6 +2706,11 @@ public class MediaProvider extends ContentProvider {
 
     private Cursor queryInternal(Uri uri, String[] projection, Bundle queryArgs,
             CancellationSignal signal, boolean forSelf) throws FallbackException {
+        if (isPickerUri(uri)) {
+            return mPickerUriResolver.query(uri, projection, queryArgs, signal,
+                    mCallingIdentity.get().pid, mCallingIdentity.get().uid);
+        }
+
         final String volumeName = getVolumeName(uri);
         PulledMetrics.logVolumeAccessViaMediaProvider(getCallingUidOrSelf(), volumeName);
         queryArgs = (queryArgs != null) ? queryArgs : new Bundle();
@@ -2755,6 +2758,15 @@ public class MediaProvider extends ContentProvider {
             MatrixCursor c = new MatrixCursor(new String[] {"version"});
             c.addRow(new Integer[] {DatabaseHelper.getDatabaseVersion(getContext())});
             return c;
+        }
+
+        // TODO(b/195008831): Add test to verify that apps can't access
+        if (table == PICKER_INTERNAL) {
+            final int limit = queryArgs.getInt(MediaStore.QUERY_ARG_LIMIT, -1);
+            final int sizeBytes = queryArgs.getInt(MediaStore.QUERY_ARG_SIZE_BYTES, -1);
+            final String mimeType =queryArgs.getString(MediaStore.QUERY_ARG_MIME_TYPE, null);
+
+            return mPickerDbFacade.queryMediaAll(limit, mimeType, sizeBytes);
         }
 
         final DatabaseHelper helper = getDatabaseForUri(uri);
@@ -2819,7 +2831,7 @@ public class MediaProvider extends ContentProvider {
         }
 
         // Update locale if necessary.
-        if (helper == mInternalDatabase && !Locale.getDefault().equals(mLastLocale)) {
+        if (helper.isInternal() && !Locale.getDefault().equals(mLastLocale)) {
             Log.i(TAG, "Updating locale within queryInternal");
             onLocaleChanged(false);
         }
@@ -3861,7 +3873,7 @@ public class MediaProvider extends ContentProvider {
         // So we only set the user_id field in the database for external storage.
         qb.allowColumn(FileColumns._USER_ID);
         int ownerUserId = FileUtils.extractUserId(path);
-        if (!helper.mInternal) {
+        if (helper.isExternal()) {
             if (isAppCloneUserForFuse(ownerUserId)) {
                 values.put(FileColumns._USER_ID, ownerUserId);
             } else {
@@ -4246,7 +4258,7 @@ public class MediaProvider extends ContentProvider {
             }
 
             case IMAGES_THUMBNAILS: {
-                if (helper.mInternal) {
+                if (helper.isInternal()) {
                     throw new UnsupportedOperationException(
                             "Writing to internal storage is not supported.");
                 }
@@ -4268,7 +4280,7 @@ public class MediaProvider extends ContentProvider {
             }
 
             case VIDEO_THUMBNAILS: {
-                if (helper.mInternal) {
+                if (helper.isInternal()) {
                     throw new UnsupportedOperationException(
                             "Writing to internal storage is not supported.");
                 }
@@ -4347,7 +4359,7 @@ public class MediaProvider extends ContentProvider {
             }
 
             case AUDIO_ALBUMART: {
-                if (helper.mInternal) {
+                if (helper.isInternal()) {
                     throw new UnsupportedOperationException("no internal album art allowed");
                 }
 
@@ -5732,6 +5744,17 @@ public class MediaProvider extends ContentProvider {
                 } finally {
                     restoreLocalCallingIdentity(token);
                 }
+            case MediaStore.SET_CLOUD_PROVIDER_CALL:
+                // TODO(b/190713331): Remove after initial development
+                final String cloudProvider = extras.getString(PickerDbFacade.KEY_CLOUD_PROVIDER);
+                Log.i(TAG, "Developer initiated cloud provider switch: " + cloudProvider);
+                mPickerSyncController.setCloudProvider(cloudProvider);
+                // fall through
+            case MediaStore.SYNC_PROVIDERS_CALL:
+                // TODO(b/190713331): Remove after initial development
+                Log.i(TAG, "Developer initiated provider sync");
+                mPickerSyncController.syncPicker();
+                return new Bundle();
             default:
                 throw new UnsupportedOperationException("Unsupported call: " + method);
         }
@@ -7072,6 +7095,13 @@ public class MediaProvider extends ContentProvider {
         return -1;
     }
 
+    private boolean isPickerUri(Uri uri) {
+        // TODO(b/188394433): move this method to PickerResolver in the spirit of not
+        // adding picker logic to MediaProvider
+        final int match = matchUri(uri, /* allowHidden */ isCallingPackageAllowedHidden());
+        return match == PICKER_ID;
+    }
+
     @Override
     public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
         return openFileCommon(uri, mode, /*signal*/ null, /*opts*/ null);
@@ -7094,6 +7124,12 @@ public class MediaProvider extends ContentProvider {
             uri = getUriForRedactedUri(uri);
         }
         uri = safeUncanonicalize(uri);
+
+        if (isPickerUri(uri)) {
+            final int callingPid = mCallingIdentity.get().pid;
+            final int callingUid = mCallingIdentity.get().uid;
+            return mPickerUriResolver.openFile(uri, mode, signal, callingPid, callingUid);
+        }
 
         final boolean allowHidden = isCallingPackageAllowedHidden();
         final int match = matchUri(uri, allowHidden);
@@ -7165,6 +7201,14 @@ public class MediaProvider extends ContentProvider {
             // 5. Return the fd from #4 to the app or throw an exception if any of the conditions
             // are not met
             return getOriginalMediaFormatFileDescriptor(opts);
+        }
+
+        // This is needed for thumbnail resolution as it doesn't go through openFileCommon
+        if (isPickerUri(uri)) {
+            final int callingPid = mCallingIdentity.get().pid;
+            final int callingUid = mCallingIdentity.get().uid;
+            return mPickerUriResolver.openTypedAssetFile(uri, mimeTypeFilter, opts, signal,
+                    callingPid, callingUid);
         }
 
         // TODO: enforce that caller has access to this uri
@@ -7389,7 +7433,7 @@ public class MediaProvider extends ContentProvider {
         final boolean callerIsOwner = Objects.equals(getCallingPackageOrSelf(), itemOwner);
         if (hasOwner && !callerIsOwner) {
             throw new IllegalStateException(
-                    "Only owner is able to interact with pending item " + item);
+                    "Only owner is able to interact with pending/trashed item " + item);
         }
     }
 
@@ -7893,6 +7937,8 @@ public class MediaProvider extends ContentProvider {
     /**
      * Calculates the ranges that need to be redacted for the given file and user that wants to
      * access the file.
+     * Note: This method assumes that the caller of this function has already done permission checks
+     * for the uid to access this path.
      *
      * @param uid UID of the package wanting to access the file
      * @param path File path
@@ -7942,16 +7988,20 @@ public class MediaProvider extends ContentProvider {
 
             final Uri contentUri = FileUtils.getContentUriForPath(path);
             final String[] projection = new String[]{
-                    MediaColumns.OWNER_PACKAGE_NAME, MediaColumns._ID };
+                    MediaColumns.OWNER_PACKAGE_NAME, MediaColumns._ID , FileColumns.MEDIA_TYPE};
             final String selection = MediaColumns.DATA + "=?";
             final String[] selectionArgs = new String[]{path};
             final String ownerPackageName;
-            final Uri item;
-            try (final Cursor c = queryForSingleItem(contentUri, projection, selection,
-                    selectionArgs, null)) {
+            final int id;
+            final int mediaType;
+            // Query as MediaProvider as non-RES apps will result in FileNotFoundException.
+            // Note: The caller uid already has passed permission checks to access this file.
+            try (final Cursor c = queryForSingleItemAsMediaProvider(contentUri, projection,
+                    selection, selectionArgs, null)) {
                 c.moveToFirst();
                 ownerPackageName = c.getString(0);
-                item = ContentUris.withAppendedId(contentUri, /*item id*/ c.getInt(1));
+                id = c.getInt(1);
+                mediaType = c.getInt(2);
             } catch (FileNotFoundException e) {
                 // Ideally, this shouldn't happen unless the file was deleted after we checked its
                 // existence and before we get to the redaction logic here. In this case we throw
@@ -7964,14 +8014,23 @@ public class MediaProvider extends ContentProvider {
             final boolean callerIsOwner = Objects.equals(getCallingPackageOrSelf(),
                     ownerPackageName);
 
+            // Do not redact if the caller is the owner
             if (callerIsOwner) {
                 return new long[0];
             }
 
-            final boolean callerHasUriPermission = getContext().checkUriPermission(
-                    item, mCallingIdentity.get().pid, mCallingIdentity.get().uid,
+            // Do not redact if the caller has write uri permission granted on the file.
+            final Uri fileUri = ContentUris.withAppendedId(contentUri, id);
+            boolean callerHasWriteUriPermission = getContext().checkUriPermission(
+                    fileUri, mCallingIdentity.get().pid, mCallingIdentity.get().uid,
                     Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == PERMISSION_GRANTED;
-            if (callerHasUriPermission) {
+            if (callerHasWriteUriPermission) {
+                return new long[0];
+            }
+            // Check if the caller has write access to other uri formats for the same file.
+            callerHasWriteUriPermission = getOtherUriGrantsForPath(path, mediaType,
+                    Long.toString(id), /* forWrite */ true) != null;
+            if (callerHasWriteUriPermission) {
                 return new long[0];
             }
 
@@ -8129,12 +8188,15 @@ public class MediaProvider extends ContentProvider {
                     MediaColumns._ID,
                     MediaColumns.OWNER_PACKAGE_NAME,
                     MediaColumns.IS_PENDING,
-                    FileColumns.MEDIA_TYPE};
+                    FileColumns.MEDIA_TYPE,
+                    MediaColumns.IS_TRASHED
+            };
             final String selection = MediaColumns.DATA + "=?";
             final String[] selectionArgs = new String[]{path};
             final long id;
             final int mediaType;
             final boolean isPending;
+            final boolean isTrashed;
             String ownerPackageName = null;
             try (final Cursor c = queryForSingleItemAsMediaProvider(contentUri, projection,
                     selection,
@@ -8143,11 +8205,12 @@ public class MediaProvider extends ContentProvider {
                 ownerPackageName = c.getString(1);
                 isPending = c.getInt(2) != 0;
                 mediaType = c.getInt(3);
+                isTrashed = c.getInt(4) != 0;
             }
             final File file = new File(path);
             Uri fileUri = MediaStore.Files.getContentUri(extractVolumeName(path), id);
             // We don't check ownership for files with IS_PENDING set by FUSE
-            if (isPending && !isPendingFromFuse(new File(path))) {
+            if (isTrashed || (isPending && !isPendingFromFuse(new File(path)))) {
                 requireOwnershipForItem(ownerPackageName, fileUri);
             }
 
@@ -8563,80 +8626,52 @@ public class MediaProvider extends ContentProvider {
         }
     }
 
-    /**
-     * Checks if the app with the given UID is allowed to create or delete the directory with the
-     * given path.
-     *
-     * @param path File path of the directory that the app wants to create/delete
-     * @param uid UID of the app that wants to create/delete the directory
-     * @param forCreate denotes whether the operation is directory creation or deletion
-     * @return 0 if the operation is allowed, or the following {@code errno} values:
-     * <ul>
-     * <li>{@link OsConstants#EACCES} if the app tries to create/delete a dir in another app's
-     * external directory, or if the calling package is a legacy app that doesn't have
-     * WRITE_EXTERNAL_STORAGE permission.
-     * <li>{@link OsConstants#EPERM} if the app tries to create/delete a top-level directory.
-     * </ul>
-     *
-     * Called from JNI in jni/MediaProviderWrapper.cpp
-     */
-    @Keep
-    public int isDirectoryCreationOrDeletionAllowedForFuse(
-            @NonNull String path, int uid, boolean forCreate) {
-        final LocalCallingIdentity token =
-                clearLocalCallingIdentity(getCachedCallingIdentityForFuse(uid));
-        PulledMetrics.logFileAccessViaFuse(getCallingUidOrSelf(), path);
+    // These need to stay in sync with MediaProviderWrapper.cpp's DirectoryAccessRequestType enum
+    @IntDef(flag = true, prefix = { "DIRECTORY_ACCESS_FOR_" }, value = {
+            DIRECTORY_ACCESS_FOR_READ,
+            DIRECTORY_ACCESS_FOR_WRITE,
+            DIRECTORY_ACCESS_FOR_CREATE,
+            DIRECTORY_ACCESS_FOR_DELETE,
+    })
+    @Retention(RetentionPolicy.SOURCE)
+    @VisibleForTesting
+    @interface DirectoryAccessType {}
 
-        try {
-            // App dirs are not indexed, so we don't create an entry for the file.
-            if (isPrivatePackagePathNotAccessibleByCaller(path)) {
-                Log.e(TAG, "Can't modify another app's external directory!");
-                return OsConstants.EACCES;
-            }
+    @VisibleForTesting
+    static final int DIRECTORY_ACCESS_FOR_READ = 1;
 
-            if (shouldBypassFuseRestrictions(/*forWrite*/ true, path)) {
-                return 0;
-            }
-            // Legacy apps that made is this far don't have the right storage permission and hence
-            // are not allowed to access anything other than their external app directory
-            if (isCallingPackageRequestingLegacy()) {
-                return OsConstants.EACCES;
-            }
+    @VisibleForTesting
+    static final int DIRECTORY_ACCESS_FOR_WRITE = 2;
 
-            final String[] relativePath = sanitizePath(extractRelativePath(path));
-            final boolean isTopLevelDir =
-                    relativePath.length == 1 && TextUtils.isEmpty(relativePath[0]);
-            if (isTopLevelDir) {
-                // We allow creating the default top level directories only, all other operations on
-                // top level directories are not allowed.
-                if (forCreate && FileUtils.isDefaultDirectoryName(extractDisplayName(path))) {
-                    return 0;
-                }
-                Log.e(TAG,
-                        "Creating a non-default top level directory or deleting an existing"
-                                + " one is not allowed!");
-                return OsConstants.EPERM;
-            }
-            return 0;
-        } finally {
-            restoreLocalCallingIdentity(token);
-        }
-    }
+    @VisibleForTesting
+    static final int DIRECTORY_ACCESS_FOR_CREATE = 3;
+
+    @VisibleForTesting
+    static final int DIRECTORY_ACCESS_FOR_DELETE = 4;
 
     /**
-     * Checks whether the app with the given UID is allowed to open the directory denoted by the
+     * Checks whether the app with the given UID is allowed to access the directory denoted by the
      * given path.
      *
      * @param path directory's path
      * @param uid UID of the requesting app
-     * @return 0 if it's allowed to open the diretory, {@link OsConstants#EACCES} if the calling
-     * package is a legacy app that doesn't have READ_EXTERNAL_STORAGE permission,
-     * {@link OsConstants#ENOENT}  otherwise.
+     * @param accessType type of access being requested - eg {@link
+     * MediaProvider#DIRECTORY_ACCESS_FOR_READ}
+     * @return 0 if it's allowed to access the directory, {@link OsConstants#ENOENT} for attempts
+     * to access a private package path in Android/data or Android/obb the caller doesn't have
+     * access to, and otherwise {@link OsConstants#EACCES} if the calling package is a legacy app
+     * that doesn't have READ_EXTERNAL_STORAGE permission or for other invalid attempts to access
+     * Android/data or Android/obb dirs.
      *
      * Called from JNI in jni/MediaProviderWrapper.cpp
      */
     @Keep
-    public int isOpendirAllowedForFuse(@NonNull String path, int uid, boolean forWrite) {
+    public int isDirAccessAllowedForFuse(@NonNull String path, int uid,
+            @DirectoryAccessType int accessType) {
+        Preconditions.checkArgumentInRange(accessType, 1, DIRECTORY_ACCESS_FOR_DELETE,
+                "accessType");
+
+        final boolean forRead = accessType == DIRECTORY_ACCESS_FOR_READ;
         final LocalCallingIdentity token =
                 clearLocalCallingIdentity(getCachedCallingIdentityForFuse(uid));
         PulledMetrics.logFileAccessViaFuse(getCallingUidOrSelf(), path);
@@ -8649,14 +8684,16 @@ public class MediaProvider extends ContentProvider {
                 return OsConstants.ENOENT;
             }
 
-            if (shouldBypassFuseRestrictions(forWrite, path)) {
+            if (shouldBypassFuseRestrictions(/* forWrite= */ !forRead, path)) {
                 return 0;
             }
 
-            // Do not allow apps to open Android/data or Android/obb dirs.
-            // On primary volumes, apps that get special access to these directories get it via
-            // mount views of lowerfs. On secondary volumes, such apps would return early from
-            // shouldBypassFuseRestrictions above.
+            // Do not allow apps that reach this point to access Android/data or Android/obb dirs.
+            // Creation should be via getContext().getExternalFilesDir() etc methods.
+            // Reads and writes on primary volumes should be via mount views of lowerfs for apps
+            // that get special access to these directories.
+            // Reads and writes on secondary volumes would be provided via an early return from
+            // shouldBypassFuseRestrictions above (again just for apps with special access).
             if (isDataOrObbPath(path)) {
                 return OsConstants.EACCES;
             }
@@ -8668,22 +8705,34 @@ public class MediaProvider extends ContentProvider {
             }
             // This is a non-legacy app. Rest of the directories are generally writable
             // except for non-default top-level directories.
-            if (forWrite) {
+            if (!forRead) {
                 final String[] relativePath = sanitizePath(extractRelativePath(path));
                 if (relativePath.length == 0) {
-                    Log.e(TAG, "Directoy write not allowed on invalid relative path for " + path);
+                    Log.e(TAG,
+                            "Directory update not allowed on invalid relative path for " + path);
                     return OsConstants.EPERM;
                 }
                 final boolean isTopLevelDir =
                         relativePath.length == 1 && TextUtils.isEmpty(relativePath[0]);
                 if (isTopLevelDir) {
-                    if (FileUtils.isDefaultDirectoryName(extractDisplayName(path))) {
-                        return 0;
-                    } else {
-                        Log.e(TAG,
-                                "Writing to a non-default top level directory is not allowed!");
+                    // We don't allow deletion of any top-level folders
+                    if (accessType == DIRECTORY_ACCESS_FOR_DELETE) {
+                        Log.e(TAG, "Deleting top level directories are not allowed!");
                         return OsConstants.EACCES;
                     }
+
+                    // We allow creating or writing to default top-level folders, but we don't
+                    // allow creation or writing to non-default top-level folders.
+                    if ((accessType == DIRECTORY_ACCESS_FOR_CREATE
+                            || accessType == DIRECTORY_ACCESS_FOR_WRITE)
+                            && FileUtils.isDefaultDirectoryName(extractDisplayName(path))) {
+                        return 0;
+                    }
+
+                    Log.e(TAG,
+                            "Creating or writing to a non-default top level directory is not "
+                                    + "allowed!");
+                    return OsConstants.EACCES;
                 }
             }
 
@@ -9323,13 +9372,6 @@ public class MediaProvider extends ContentProvider {
         return false;
     }
 
-    static boolean isInternalMediaDatabaseName(String name) {
-        if (INTERNAL_DATABASE_NAME.equals(name)) {
-            return true;
-        }
-        return false;
-    }
-
     private @NonNull Uri getBaseContentUri(@NonNull String volumeName) {
         return MediaStore.AUTHORITY_URI.buildUpon().appendPath(volumeName).build();
     }
@@ -9379,7 +9421,7 @@ public class MediaProvider extends ContentProvider {
                 // We just finished the database operation above, we know that
                 // it's ready to answer queries, so notify our DocumentProvider
                 // so it can answer queries without risking ANR
-                MediaDocumentsProvider.onMediaStoreReady(getContext(), volumeName);
+                MediaDocumentsProvider.onMediaStoreReady(getContext());
             });
         }
         return uri;
@@ -9444,6 +9486,9 @@ public class MediaProvider extends ContentProvider {
 
     private DatabaseHelper mInternalDatabase;
     private DatabaseHelper mExternalDatabase;
+    private PickerDbFacade mPickerDbFacade;
+    private ExternalDbFacade mExternalDbFacade;
+    private PickerSyncController mPickerSyncController;
     private TranscodeHelper mTranscodeHelper;
 
     // name of the volume currently being scanned by the media scanner (or null)
@@ -9502,6 +9547,10 @@ public class MediaProvider extends ContentProvider {
     static final int DOWNLOADS = 800;
     static final int DOWNLOADS_ID = 801;
 
+    static final int PICKER = 900;
+    static final int PICKER_ID = 901;
+    static final int PICKER_INTERNAL = 902;
+
     private static final HashSet<Integer> REDACTED_URI_SUPPORTED_TYPES = new HashSet<>(
             Arrays.asList(AUDIO_MEDIA_ID, IMAGES_MEDIA_ID, VIDEO_MEDIA_ID, FILES_ID, DOWNLOADS_ID));
 
@@ -9541,6 +9590,17 @@ public class MediaProvider extends ContentProvider {
         }
 
         public LocalUriMatcher(String auth) {
+            // Warning: Do not move these exact string matches below "*/.." matches.
+            // If "*/.." match is added to mPublic children before "picker/#/#", then while matching
+            // "picker/0/10", UriMatcher matches "*" node with "picker" and tries to match "0/10"
+            // with children of "*".
+            // UriMatcher does not look for exact "picker" string match if it finds * node before
+            // it. It finds the first best child match and proceeds the match from there without
+            // looking at other siblings.
+            mPublic.addURI(auth, "picker", PICKER);
+            // content://media/picker/<user-id>/<media-id>
+            mPublic.addURI(auth, "picker/#/#", PICKER_ID);
+
             mPublic.addURI(auth, "*/images/media", IMAGES_MEDIA);
             mPublic.addURI(auth, "*/images/media/#", IMAGES_MEDIA_ID);
             mPublic.addURI(auth, "*/images/media/#/thumbnail", IMAGES_MEDIA_ID_THUMBNAIL);
@@ -9585,6 +9645,7 @@ public class MediaProvider extends ContentProvider {
             // NOTE: technically hidden, since Uri is never exposed
             mPublic.addURI(auth, "*/version", VERSION);
 
+            mHidden.addURI(auth, "picker_internal", PICKER_INTERNAL);
             mHidden.addURI(auth, "*", VOLUMES_ID);
             mHidden.addURI(auth, null, VOLUMES);
 
@@ -9711,6 +9772,14 @@ public class MediaProvider extends ContentProvider {
             builder.appendPath(basePath.get(i));
         }
         return builder.build();
+    }
+
+    public DatabaseHelper getExternalDatabaseHelper() {
+        return mExternalDatabase;
+    }
+
+    public PickerSyncController getPickerSyncController() {
+        return mPickerSyncController;
     }
 
     private boolean isCallingPackageSystemGallery() {
