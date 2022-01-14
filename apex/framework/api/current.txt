@@ -47,6 +47,7 @@ package android.provider {
   public static final class CloudMediaProviderContract.MediaColumns {
     field public static final String DATE_TAKEN_MS = "date_taken_ms";
     field public static final String DURATION_MS = "duration_ms";
+    field public static final String GENERATION_MODIFIED = "generation_modified";
     field public static final String ID = "id";
     field public static final String IS_FAVORITE = "is_favorite";
     field public static final String MEDIA_STORE_URI = "media_store_uri";
@@ -67,6 +68,7 @@ package android.provider {
     method @NonNull public static android.app.PendingIntent createFavoriteRequest(@NonNull android.content.ContentResolver, @NonNull java.util.Collection<android.net.Uri>, boolean);
     method @NonNull public static android.app.PendingIntent createTrashRequest(@NonNull android.content.ContentResolver, @NonNull java.util.Collection<android.net.Uri>, boolean);
     method @NonNull public static android.app.PendingIntent createWriteRequest(@NonNull android.content.ContentResolver, @NonNull java.util.Collection<android.net.Uri>);
+    method @Nullable public static String getCloudProvider(@NonNull android.content.ContentResolver);
     method @Nullable public static android.net.Uri getDocumentUri(@NonNull android.content.Context, @NonNull android.net.Uri);
     method @NonNull public static java.util.Set<java.lang.String> getExternalVolumeNames(@NonNull android.content.Context);
     method public static long getGeneration(@NonNull android.content.Context, @NonNull String);
@@ -82,6 +84,7 @@ package android.provider {
     method @NonNull public static String getVersion(@NonNull android.content.Context, @NonNull String);
     method @NonNull public static String getVolumeName(@NonNull android.net.Uri);
     method public static boolean isCurrentSystemGallery(@NonNull android.content.ContentResolver, int, @NonNull String);
+    method public static boolean notifyCloudEvent(@NonNull android.content.ContentResolver);
     method @Deprecated @NonNull public static android.net.Uri setIncludePending(@NonNull android.net.Uri);
     method @NonNull public static android.net.Uri setRequireOriginal(@NonNull android.net.Uri);
     field public static final String ACTION_IMAGE_CAPTURE = "android.media.action.IMAGE_CAPTURE";
