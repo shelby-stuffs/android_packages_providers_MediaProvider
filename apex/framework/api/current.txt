@@ -9,6 +9,7 @@ package android.provider {
     method public final int delete(@NonNull android.net.Uri, @Nullable String, @Nullable String[]);
     method @NonNull public final String getType(@NonNull android.net.Uri);
     method @NonNull public final android.net.Uri insert(@NonNull android.net.Uri, @NonNull android.content.ContentValues);
+    method @NonNull public android.os.Bundle onGetAccountInfo(@Nullable android.os.Bundle);
     method @NonNull public abstract android.os.Bundle onGetMediaInfo(@Nullable android.os.Bundle);
     method @NonNull public abstract android.os.ParcelFileDescriptor onOpenMedia(@NonNull String, @Nullable android.os.CancellationSignal) throws java.io.FileNotFoundException;
     method @NonNull public abstract android.content.res.AssetFileDescriptor onOpenThumbnail(@NonNull String, @NonNull android.graphics.Point, @Nullable android.os.CancellationSignal) throws java.io.FileNotFoundException;
@@ -36,6 +37,11 @@ package android.provider {
     field public static final String PROVIDER_INTERFACE = "android.content.action.CLOUD_MEDIA_PROVIDER";
   }
 
+  public static final class CloudMediaProviderContract.AccountInfo {
+    field public static final String ACCOUNT_CONFIGURATION_INTENT = "account_configuration_intent";
+    field public static final String ACTIVE_ACCOUNT_NAME = "active_account_name";
+  }
+
   public static final class CloudMediaProviderContract.AlbumColumns {
     field public static final String DATE_TAKEN_MS = "date_taken_ms";
     field public static final String DISPLAY_NAME = "display_name";
@@ -53,6 +59,10 @@ package android.provider {
     field public static final String MEDIA_STORE_URI = "media_store_uri";
     field public static final String MIME_TYPE = "mime_type";
     field public static final String SIZE_BYTES = "size_bytes";
+    field public static final String STANDARD_MIME_TYPE_EXTENSION = "standard_mime_type_extension";
+    field public static final int STANDARD_MIME_TYPE_EXTENSION_GIF = 1; // 0x1
+    field public static final int STANDARD_MIME_TYPE_EXTENSION_MOTION_PHOTO = 2; // 0x2
+    field public static final int STANDARD_MIME_TYPE_EXTENSION_NONE = 0; // 0x0
   }
 
   public static final class CloudMediaProviderContract.MediaInfo {
