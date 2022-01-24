@@ -239,6 +239,7 @@ import com.android.providers.media.util.PermissionUtils;
 import com.android.providers.media.util.Preconditions;
 import com.android.providers.media.util.SQLiteQueryBuilder;
 import com.android.providers.media.util.SpecialFormatDetector;
+import com.android.providers.media.util.StringUtils;
 import com.android.providers.media.util.UserCache;
 import com.android.providers.media.util.XmpInterface;
 
@@ -874,7 +875,17 @@ public class MediaProvider extends ContentProvider {
             // folders should not be automatically created inside them.
             return;
         }
-        final String key = "created_default_folders_" + volume.getId();
+        final String volumeName = volume.getName();
+        String key;
+        if (volumeName.equals(MediaStore.VOLUME_EXTERNAL_PRIMARY)) {
+            // For the primary volume, we use the ID, because we may be handling
+            // the primary volume for multiple users
+            key = "created_default_folders_" + volume.getId();
+        } else {
+            // For others, like public volumes, just use the name, because the id
+            // might not change when re-formatted
+            key = "created_default_folders_" + volumeName;
+        }
 
         final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(getContext());
         if (prefs.getInt(key, 0) == 0) {
@@ -1211,6 +1222,12 @@ public class MediaProvider extends ContentProvider {
         synchronized (mDirectoryCache) {
             mDirectoryCache.clear();
         }
+    }
+
+    @VisibleForTesting
+    public void setUriResolver(PickerUriResolver resolver) {
+        Log.w(TAG, "Changing the PickerUriResolver!!! Should only be called during test");
+        mPickerUriResolver = resolver;
     }
 
     @VisibleForTesting
@@ -2281,7 +2298,7 @@ public class MediaProvider extends ContentProvider {
                 supportedPrimaryMimeType = ClipDescription.MIMETYPE_UNKNOWN;
         }
         return (supportedPrimaryMimeType.equalsIgnoreCase(ClipDescription.MIMETYPE_UNKNOWN) ||
-                MimeUtils.startsWithIgnoreCase(mimeType, supportedPrimaryMimeType));
+                StringUtils.startsWithIgnoreCase(mimeType, supportedPrimaryMimeType));
     }
 
     /**
@@ -7612,7 +7629,7 @@ public class MediaProvider extends ContentProvider {
 
         // Offer thumbnail of media, when requested
         final boolean wantsThumb = (opts != null) && opts.containsKey(ContentResolver.EXTRA_SIZE)
-                && MimeUtils.startsWithIgnoreCase(mimeTypeFilter, "image/");
+                && StringUtils.startsWithIgnoreCase(mimeTypeFilter, "image/");
         if (wantsThumb) {
             final ParcelFileDescriptor pfd = ensureThumbnail(uri, signal);
             return new AssetFileDescriptor(pfd, 0, AssetFileDescriptor.UNKNOWN_LENGTH);
