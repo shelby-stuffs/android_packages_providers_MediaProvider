@@ -35,6 +35,7 @@ import androidx.test.ext.junit.rules.ActivityScenarioRule;
 
 import com.android.providers.media.R;
 
+import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 
@@ -98,6 +99,7 @@ public class SpecialFormatMultiSelectTest extends SpecialFormatBaseTest {
     }
 
     @Test
+    @Ignore("Enable after b/218806007 is fixed")
     public void testPreview_multiSelect_longPress_motionPhoto() {
         onView(withId(PICKER_TAB_RECYCLERVIEW_ID)).check(matches(isDisplayed()));
 
@@ -113,6 +115,7 @@ public class SpecialFormatMultiSelectTest extends SpecialFormatBaseTest {
     }
 
     @Test
+    @Ignore("Enable after b/218806007 is fixed")
     public void testPreview_multiSelect_navigation() {
         onView(withId(PICKER_TAB_RECYCLERVIEW_ID)).check(matches(isDisplayed()));
 
@@ -142,42 +145,42 @@ public class SpecialFormatMultiSelectTest extends SpecialFormatBaseTest {
         onView(withId(PREVIEW_MOTION_PHOTO_ID)).check(doesNotExist());
         onView(withId(PREVIEW_GIF_ID)).check(doesNotExist());
 
-        swipeLeftAndWait();
+        swipeLeftAndWait(PREVIEW_VIEW_PAGER_ID);
         // 2. Gif
         onView(withId(PREVIEW_GIF_ID)).check(matches(isDisplayed()));
         onView(withId(PREVIEW_MOTION_PHOTO_ID)).check(doesNotExist());
 
-        swipeLeftAndWait();
+        swipeLeftAndWait(PREVIEW_VIEW_PAGER_ID);
         // 3. Animated Webp
         onView(withId(PREVIEW_GIF_ID)).check(matches(isDisplayed()));
         onView(withId(PREVIEW_MOTION_PHOTO_ID)).check(doesNotExist());
 
-        swipeLeftAndWait();
+        swipeLeftAndWait(PREVIEW_VIEW_PAGER_ID);
         // 4. Motion Photo
         onView(withId(PREVIEW_MOTION_PHOTO_ID)).check(matches(isDisplayed()));
         onView(withId(PREVIEW_GIF_ID)).check(doesNotExist());
 
-        swipeLeftAndWait();
+        swipeLeftAndWait(PREVIEW_VIEW_PAGER_ID);
         // 5. Non-Animated Webp
         onView(withId(PREVIEW_GIF_ID)).check(doesNotExist());
         onView(withId(PREVIEW_MOTION_PHOTO_ID)).check(doesNotExist());
 
-        swipeRightAndWait();
+        swipeRightAndWait(PREVIEW_VIEW_PAGER_ID);
         // 4. Motion Photo
         onView(withId(PREVIEW_MOTION_PHOTO_ID)).check(matches(isDisplayed()));
         onView(withId(PREVIEW_GIF_ID)).check(doesNotExist());
 
-        swipeRightAndWait();
+        swipeRightAndWait(PREVIEW_VIEW_PAGER_ID);
         // 3. Animated Webp
         onView(withId(PREVIEW_GIF_ID)).check(matches(isDisplayed()));
         onView(withId(PREVIEW_MOTION_PHOTO_ID)).check(doesNotExist());
 
-        swipeRightAndWait();
+        swipeRightAndWait(PREVIEW_VIEW_PAGER_ID);
         // 2. Gif
         onView(withId(PREVIEW_GIF_ID)).check(matches(isDisplayed()));
         onView(withId(PREVIEW_MOTION_PHOTO_ID)).check(doesNotExist());
 
-        swipeRightAndWait();
+        swipeRightAndWait(PREVIEW_VIEW_PAGER_ID);
         // 1. Image
         onView(withId(PREVIEW_MOTION_PHOTO_ID)).check(doesNotExist());
         onView(withId(PREVIEW_GIF_ID)).check(doesNotExist());

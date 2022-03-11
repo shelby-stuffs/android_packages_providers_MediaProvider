@@ -17,8 +17,8 @@
 package com.android.providers.media.photopicker;
 
 import static android.provider.CloudMediaProviderContract.EXTRA_LOOPING_PLAYBACK_ENABLED;
-import static android.provider.CloudMediaProvider.SurfaceEventCallback.PLAYBACK_EVENT_READY;
-import static android.provider.CloudMediaProviderContract.MediaInfo;
+import static android.provider.CloudMediaProvider.CloudMediaSurfaceEventCallback.PLAYBACK_EVENT_READY;
+import static android.provider.CloudMediaProviderContract.MediaCollectionInfo;
 
 import android.annotation.DurationMillisLong;
 import android.content.ContentProviderClient;
@@ -83,17 +83,12 @@ public class PhotoPickerProvider extends CloudMediaProvider {
     }
 
     @Override
-    public Cursor onQueryMedia(@NonNull String mediaId) {
-        return mDbFacade.queryMediaId(Long.parseLong(mediaId));
-    }
-
-    @Override
     public Cursor onQueryMedia(@Nullable Bundle extras) {
         // TODO(b/190713331): Handle extra_page
         final CloudProviderQueryExtras queryExtras =
                 CloudProviderQueryExtras.fromCloudMediaBundle(extras);
 
-        return mDbFacade.queryMediaGeneration(queryExtras.getGeneration(), queryExtras.getAlbumId(),
+        return mDbFacade.queryMedia(queryExtras.getGeneration(), queryExtras.getAlbumId(),
                 queryExtras.getMimeType());
     }
 
@@ -141,20 +136,21 @@ public class PhotoPickerProvider extends CloudMediaProvider {
     }
 
     @Override
-    public Bundle onGetMediaInfo(@Nullable Bundle extras) {
+    public Bundle onGetMediaCollectionInfo(@Nullable Bundle extras) {
         final CloudProviderQueryExtras queryExtras =
                 CloudProviderQueryExtras.fromCloudMediaBundle(extras);
 
         // TODO(b/190713331): Handle extra_filter_albums
         Bundle bundle = new Bundle();
-        try (Cursor cursor = mDbFacade.getMediaInfo(queryExtras.getGeneration())) {
+        try (Cursor cursor = mDbFacade.getMediaCollectionInfo(queryExtras.getGeneration())) {
             if (cursor.moveToFirst()) {
-                int generationIndex = cursor.getColumnIndexOrThrow(MediaInfo.MEDIA_GENERATION);
-                int countIndex = cursor.getColumnIndexOrThrow(MediaInfo.MEDIA_COUNT);
+                int generationIndex = cursor.getColumnIndexOrThrow(
+                        MediaCollectionInfo.LAST_MEDIA_SYNC_GENERATION);
 
-                bundle.putString(MediaInfo.MEDIA_VERSION, MediaStore.getVersion(getContext()));
-                bundle.putLong(MediaInfo.MEDIA_GENERATION, cursor.getLong(generationIndex));
-                bundle.putLong(MediaInfo.MEDIA_COUNT, cursor.getLong(countIndex));
+                bundle.putString(MediaCollectionInfo.MEDIA_COLLECTION_ID,
+                        MediaStore.getVersion(getContext()));
+                bundle.putLong(MediaCollectionInfo.LAST_MEDIA_SYNC_GENERATION,
+                        cursor.getLong(generationIndex));
             }
         }
         return bundle;
@@ -162,12 +158,12 @@ public class PhotoPickerProvider extends CloudMediaProvider {
 
     @Override
     @Nullable
-    public SurfaceController onCreateSurfaceController(@Nullable Bundle config,
-            SurfaceEventCallback callback) {
+    public CloudMediaSurfaceController onCreateCloudMediaSurfaceController(@Nullable Bundle config,
+            CloudMediaSurfaceEventCallback callback) {
         if (RemotePreviewHandler.isRemotePreviewEnabled()) {
             boolean enableLoop = config != null && config.getBoolean(EXTRA_LOOPING_PLAYBACK_ENABLED,
                     false);
-            return new SurfaceControllerImpl(getContext(), enableLoop, callback);
+            return new CloudMediaSurfaceControllerImpl(getContext(), enableLoop, callback);
         }
         return null;
     }
@@ -186,7 +182,7 @@ public class PhotoPickerProvider extends CloudMediaProvider {
                 Long.parseLong(mediaId));
     }
 
-    private static final class SurfaceControllerImpl extends SurfaceController {
+    private static final class CloudMediaSurfaceControllerImpl extends CloudMediaSurfaceController {
 
         // The minimum duration of media that the player will attempt to ensure is buffered at all
         // times.
@@ -207,13 +203,14 @@ public class PhotoPickerProvider extends CloudMediaProvider {
                         BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS).build();
 
         private final Context mContext;
-        private final SurfaceEventCallback mCallback;
+        private final CloudMediaSurfaceEventCallback mCallback;
         private final Handler mHandler = new Handler(Looper.getMainLooper());
         private final boolean mEnableLoop;
         private ExoPlayer mPlayer;
         private int mCurrentSurfaceId = -1;
 
-        SurfaceControllerImpl(Context context, boolean enableLoop, SurfaceEventCallback callback) {
+        CloudMediaSurfaceControllerImpl(Context context, boolean enableLoop,
+                CloudMediaSurfaceEventCallback callback) {
             mCallback = callback;
             mContext = context;
             mEnableLoop = enableLoop;
