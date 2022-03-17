@@ -18,6 +18,7 @@ package com.android.providers.media.photopicker.data;
 
 import static android.provider.CloudMediaProviderContract.MediaColumns;
 import static android.provider.MediaStore.PickerMediaColumns;
+import static com.android.providers.media.PickerUriResolver.getMediaUri;
 import static com.android.providers.media.photopicker.util.CursorUtils.getCursorLong;
 import static com.android.providers.media.photopicker.util.CursorUtils.getCursorString;
 import static com.android.providers.media.util.DatabaseUtils.replaceMatchAnyChar;
@@ -656,7 +657,7 @@ public class PickerDbFacade {
         final SQLiteQueryBuilder qb = createVisibleMediaQueryBuilder();
         final String[] selectionArgs = buildSelectionArgs(qb, query);
 
-        return queryMediaForUi(qb, selectionArgs, query.limit);
+        return queryMediaForUi(qb, selectionArgs, query.limit, TABLE_MEDIA);
     }
 
     /**
@@ -674,7 +675,7 @@ public class PickerDbFacade {
         final SQLiteQueryBuilder qb = createAlbumMediaQueryBuilder(isLocal);
         final String[] selectionArgs = buildSelectionArgs(qb, query);
 
-        return queryAlbumMediaForUi(qb, selectionArgs, query.limit);
+        return queryMediaForUi(qb, selectionArgs, query.limit, TABLE_ALBUM_MEDIA);
     }
 
     /**
@@ -696,7 +697,8 @@ public class PickerDbFacade {
 
         synchronized (mLock) {
             if (authority.equals(mLocalProvider) || authority.equals(mCloudProvider)) {
-                return qb.query(mDatabase, getMediaStoreProjectionLocked(projection),
+                return qb.query(mDatabase, getMediaStoreProjectionLocked(authority, mediaId,
+                                projection),
                         /* selection */ null, selectionArgs, /* groupBy */ null, /* having */ null,
                         /* orderBy */ null, /* limitStr */ null);
             }
@@ -744,7 +746,7 @@ public class PickerDbFacade {
     }
 
     public static int getDefaultPickerDbSyncDelayMs() {
-        return SystemProperties.getInt(PROP_DEFAULT_SYNC_DELAY_MS, 1000);
+        return SystemProperties.getInt(PROP_DEFAULT_SYNC_DELAY_MS, 5000);
     }
 
     private boolean isLocal(String authority) {
@@ -752,9 +754,9 @@ public class PickerDbFacade {
     }
 
     private Cursor queryMediaForUi(SQLiteQueryBuilder qb, String[] selectionArgs,
-            int limit) {
+            int limit, String tableName) {
         // Use the <table>.<column> form to order _id to avoid ordering against the projection '_id'
-        final String orderBy = getOrderClause(TABLE_MEDIA);
+        final String orderBy = getOrderClause(tableName);
         final String limitStr = String.valueOf(limit);
 
         // Hold lock while checking the cloud provider and querying so that cursor extras containing
@@ -775,26 +777,6 @@ public class PickerDbFacade {
         return "date_taken_ms DESC," + tableName + "._id DESC";
     }
 
-    private Cursor queryAlbumMediaForUi(SQLiteQueryBuilder qb, String[] selectionArgs,
-            int limit) {
-        // Use the <table>.<column> form to order _id to avoid ordering against the projection '_id'
-        final String orderBy = getOrderClause(TABLE_ALBUM_MEDIA);
-        final String limitStr = String.valueOf(limit);
-
-        // Hold lock while checking the cloud provider and querying so that cursor extras containing
-        // the cloud provider is consistent with the cursor results and doesn't race with
-        // #setCloudProvider
-        synchronized (mLock) {
-            if (mCloudProvider == null) {
-                // If cloud provider is null, skip all cloud items in the picker db
-                qb.appendWhereStandalone(WHERE_NULL_CLOUD_ID);
-            }
-
-            return qb.query(mDatabase, getAlbumMediaProjectionLocked(), /* selection */ null,
-                    selectionArgs, /* groupBy */ null, /* having */ null, orderBy, limitStr);
-        }
-    }
-
     private String[] getCloudMediaProjectionLocked() {
         return new String[] {
             getProjectionAuthorityLocked(),
@@ -810,22 +792,8 @@ public class PickerDbFacade {
         };
     }
 
-    // TODO(b/219942243): Remove this after generation is added.
-    private String[] getAlbumMediaProjectionLocked() {
-        return new String[] {
-                getProjectionAuthorityLocked(),
-                getProjectionDataLocked(MediaColumns.DATA),
-                getProjectionId(MediaColumns.ID),
-                getProjectionSimple(KEY_DATE_TAKEN_MS, MediaColumns.DATE_TAKEN_MILLIS),
-                getProjectionSimple(KEY_SIZE_BYTES, MediaColumns.SIZE_BYTES),
-                getProjectionSimple(KEY_DURATION_MS, MediaColumns.DURATION_MILLIS),
-                getProjectionSimple(KEY_MIME_TYPE, MediaColumns.MIME_TYPE),
-                getProjectionSimple(KEY_STANDARD_MIME_TYPE_EXTENSION,
-                        MediaColumns.STANDARD_MIME_TYPE_EXTENSION),
-        };
-    }
-
-    private String[] getMediaStoreProjectionLocked(String[] columns) {
+    private String[] getMediaStoreProjectionLocked(String authority, String mediaId,
+            String[] columns) {
         final String[] projection = new String[columns.length];
 
         for (int i = 0; i < projection.length; i++) {
@@ -853,8 +821,9 @@ public class PickerDbFacade {
                             PickerMediaColumns.DURATION_MILLIS);
                     break;
                 default:
-                    projection[i] = "";
-                    Log.w(TAG, "Unexpected MediaStore column: " + columns[i]);
+                    Uri uri = getMediaUri(authority).buildUpon().appendPath(mediaId).build();
+                    throw new IllegalArgumentException("Unexpected picker URI projection. Uri:"
+                            + uri + ". Column:" + columns[i]);
             }
         }
 
@@ -968,7 +937,9 @@ public class PickerDbFacade {
                     values.put(KEY_DURATION_MS, cursor.getLong(index));
                     break;
                 case CloudMediaProviderContract.MediaColumns.IS_FAVORITE:
-                    values.put(KEY_IS_FAVORITE, cursor.getInt(index));
+                    if(TextUtils.isEmpty(albumId)) {
+                        values.put(KEY_IS_FAVORITE, cursor.getInt(index));
+                    }
                     break;
                 default:
                     Log.w(TAG, "Unexpected cursor key: " + key);
