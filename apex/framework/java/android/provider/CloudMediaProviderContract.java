@@ -455,7 +455,7 @@ public final class CloudMediaProviderContract {
     /**
      * Limits the query results to only media items matching the given album id.
      * <p>
-     * If the provider handled the album filter, they must also add the {@link #EXTRA_FILTER_ALBUM}
+     * If the provider handled the album filter, they must also add the {@link #EXTRA_ALBUM_ID}
      * key to the array of {@link ContentResolver#EXTRA_HONORED_ARGS} as part of the returned
      * {@link Cursor#setExtras} {@link Bundle}.
      *
@@ -463,7 +463,7 @@ public final class CloudMediaProviderContract {
      * <p>
      * Type: STRING
      */
-    public static final String EXTRA_FILTER_ALBUM = "android.provider.extra.FILTER_ALBUM";
+    public static final String EXTRA_ALBUM_ID = "android.provider.extra.ALBUM_ID";
 
     /**
      * Limits the query results to only media items matching the give mimetype.
@@ -474,8 +474,9 @@ public final class CloudMediaProviderContract {
      * @see CloudMediaProvider#onQueryMedia
      * <p>
      * Type: STRING
+     * @hide
      */
-    public static final String EXTRA_FILTER_MIME_TYPE = "android.provider.extra.FILTER_MIME_TYPE";
+    public static final String EXTRA_MIME_TYPE = "android.provider.extra.MIME_TYPE";
 
     /**
      * Limits the query results to only media items less than the given file size in bytes.
@@ -488,7 +489,8 @@ public final class CloudMediaProviderContract {
      * Type: LONG
      * @hide
      */
-    public static final String EXTRA_FILTER_SIZE_BYTES = "android.provider.extra.FILTER_SIZE_BYTES";
+    public static final String EXTRA_SIZE_LIMIT_BYTES =
+            "android.provider.extra.EXTRA_SIZE_LIMIT_BYTES";
 
     /**
      * Forces the {@link CloudMediaProvider#onOpenPreview} file descriptor to return a thumbnail
@@ -552,15 +554,15 @@ public final class CloudMediaProviderContract {
             "android.provider.extra.SURFACE_CONTROLLER_AUDIO_MUTE_ENABLED";
 
     /**
-     * Gets surface event callback from picker launched via
+     * Gets surface state callback from picker launched via
      * {@link MediaStore#ACTION_PICK_IMAGES}).
      *
      * @see MediaStore#ACTION_PICK_IMAGES
      *
      * {@hide}
      */
-    public static final String EXTRA_SURFACE_EVENT_CALLBACK =
-            "android.provider.extra.SURFACE_EVENT_CALLBACK";
+    public static final String EXTRA_SURFACE_STATE_CALLBACK =
+            "android.provider.extra.SURFACE_STATE_CALLBACK";
 
     /**
      * Constant used to execute {@link CloudMediaProvider#onGetAsyncContentProvider()} via
