@@ -149,19 +149,7 @@ public class PhotoPickerProvider extends CloudMediaProvider {
         final CloudProviderQueryExtras queryExtras =
                 CloudProviderQueryExtras.fromCloudMediaBundle(extras);
 
-        Bundle bundle = new Bundle();
-        try (Cursor cursor = mDbFacade.getMediaCollectionInfo(queryExtras.getGeneration())) {
-            if (cursor.moveToFirst()) {
-                int generationIndex = cursor.getColumnIndexOrThrow(
-                        MediaCollectionInfo.LAST_MEDIA_SYNC_GENERATION);
-
-                bundle.putString(MediaCollectionInfo.MEDIA_COLLECTION_ID,
-                        MediaStore.getVersion(getContext()));
-                bundle.putLong(MediaCollectionInfo.LAST_MEDIA_SYNC_GENERATION,
-                        cursor.getLong(generationIndex));
-            }
-        }
-        return bundle;
+        return mDbFacade.getMediaCollectionInfo(queryExtras.getGeneration());
     }
 
     @Override
@@ -409,11 +397,11 @@ public class PhotoPickerProvider extends CloudMediaProvider {
 
             return new ExoPlayer.Builder(mContext,
                     new DefaultRenderersFactory(mContext),
-                    new DefaultTrackSelector(mContext),
                     mediaSourceFactory,
+                    new DefaultTrackSelector(mContext),
                     sLoadControl,
                     DefaultBandwidthMeter.getSingletonInstance(mContext),
-                    new AnalyticsCollector(Clock.DEFAULT)).buildExoPlayer();
+                    new AnalyticsCollector(Clock.DEFAULT)).build();
         }
 
         private void updateLoopingPlaybackStatus() {

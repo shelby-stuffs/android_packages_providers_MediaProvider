@@ -47,12 +47,9 @@ import static android.provider.MediaStore.VOLUME_EXTERNAL;
 import static android.provider.MediaStore.getVolumeName;
 import static android.system.OsConstants.F_GETFL;
 
-import static com.android.providers.media.DatabaseHelper.DATA_MEDIA_XATTR_DIRECTORY_PATH;
 import static com.android.providers.media.DatabaseHelper.EXTERNAL_DATABASE_NAME;
 import static com.android.providers.media.DatabaseHelper.INTERNAL_DATABASE_NAME;
-import static com.android.providers.media.DatabaseHelper.getNextRowIdBackupFrequency;
 import static com.android.providers.media.DatabaseHelper.isNextRowIdBackupEnabled;
-import static com.android.providers.media.DatabaseHelper.setXattr;
 import static com.android.providers.media.LocalCallingIdentity.APPOP_REQUEST_INSTALL_PACKAGES_FOR_SHARED_UID;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_ACCESS_MTP;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_INSTALL_PACKAGES;
@@ -839,16 +836,17 @@ public class MediaProvider extends ContentProvider {
             return;
         }
 
-        // TODO(b/222244140): Store next row id in memory to avoid reading from xattr on every
-        // insert.
-        if (!helper.getNextRowIdFromXattr().isPresent()) {
+        Optional<Long> nextRowIdBackupOptional = helper.getNextRowId();
+        if (!nextRowIdBackupOptional.isPresent()) {
             throw new RuntimeException(String.format("Cannot find next row id xattr for %s.",
                     helper.getDatabaseName()));
         }
 
-        long currentNextRowIdBackUp = helper.getNextRowIdFromXattr().get();
-        if (id >= currentNextRowIdBackUp) {
+        if (id >= nextRowIdBackupOptional.get()) {
             helper.backupNextRowId(id);
+        } else {
+            Log.v(TAG, String.format("Inserted id:%d less than next row id backup:%d.", id,
+                    nextRowIdBackupOptional.get()));
         }
     }
 
@@ -1060,7 +1058,7 @@ public class MediaProvider extends ContentProvider {
                 MIGRATION_LISTENER, mIdGenerator);
         mExternalDbFacade = new ExternalDbFacade(getContext(), mExternalDatabase);
         mPickerDbFacade = new PickerDbFacade(context);
-        mPickerSyncController = new PickerSyncController(context, mPickerDbFacade);
+        mPickerSyncController = new PickerSyncController(context, mPickerDbFacade, this);
         mPickerDataLayer = new PickerDataLayer(context, mPickerDbFacade, mPickerSyncController);
         mPickerUriResolver = new PickerUriResolver(context, mPickerDbFacade);
 
@@ -1165,6 +1163,16 @@ public class MediaProvider extends ContentProvider {
 
         PulledMetrics.initialize(context);
         return true;
+    }
+
+    Optional<DatabaseHelper> getDatabaseHelper(String dbName) {
+        if (dbName.equalsIgnoreCase(INTERNAL_DATABASE_NAME)) {
+            return Optional.of(mInternalDatabase);
+        } else if (dbName.equalsIgnoreCase(EXTERNAL_DATABASE_NAME)) {
+            return Optional.of(mExternalDatabase);
+        }
+
+        return Optional.empty();
     }
 
     @Override
@@ -5951,9 +5959,8 @@ public class MediaProvider extends ContentProvider {
     private int deleteWithOtherUriGrants(@NonNull Uri uri, DatabaseHelper helper,
             String[] projection, String userWhere, String[] userWhereArgs,
             @Nullable Bundle extras) {
-        try {
-            Cursor c = queryForSingleItemAsMediaProvider(uri, projection, userWhere, userWhereArgs,
-                    null);
+        try (Cursor c = queryForSingleItemAsMediaProvider(uri, projection, userWhere, userWhereArgs,
+                    null)) {
             final int mediaType = c.getInt(0);
             final String data = c.getString(1);
             final long id = c.getLong(2);
@@ -9684,6 +9691,20 @@ public class MediaProvider extends ContentProvider {
         try {
             return DeviceConfig.getInt(DeviceConfig.NAMESPACE_STORAGE_NATIVE_BOOT, key,
                     defaultValue);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+    }
+
+    @VisibleForTesting
+    public int getIntDeviceConfig(String namespace, String key, int defaultValue) {
+        if (!canReadDeviceConfig(key, defaultValue)) {
+            return defaultValue;
+        }
+
+        final long token = Binder.clearCallingIdentity();
+        try {
+            return DeviceConfig.getInt(namespace, key, defaultValue);
         } finally {
             Binder.restoreCallingIdentity(token);
         }
