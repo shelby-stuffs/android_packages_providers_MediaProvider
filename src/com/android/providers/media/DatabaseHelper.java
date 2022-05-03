@@ -66,6 +66,7 @@ import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
 import com.android.modules.utils.BackgroundThread;
+import com.android.providers.media.dao.FileRow;
 import com.android.providers.media.playlist.Playlist;
 import com.android.providers.media.util.DatabaseUtils;
 import com.android.providers.media.util.FileUtils;
@@ -216,20 +217,13 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     }
 
     public interface OnFilesChangeListener {
-        void onInsert(@NonNull DatabaseHelper helper, @NonNull String volumeName, long id,
-                int mediaType, boolean isDownload, boolean isPending);
+        void onInsert(@NonNull DatabaseHelper helper, @NonNull FileRow insertedRow);
 
-        void onUpdate(@NonNull DatabaseHelper helper, @NonNull String volumeName,
-                long oldId, int oldMediaType, boolean oldIsDownload,
-                long newId, int newMediaType, boolean newIsDownload,
-                boolean oldIsTrashed, boolean newIsTrashed,
-                boolean oldIsPending, boolean newIsPending,
-                boolean oldIsFavorite, boolean newIsFavorite,
-                int oldSpecialFormat, int newSpecialFormat,
-                String oldOwnerPackage, String newOwnerPackage, String oldPath);
+        void onUpdate(@NonNull DatabaseHelper helper, @NonNull FileRow oldRow,
+                @NonNull FileRow newRow);
 
-        void onDelete(@NonNull DatabaseHelper helper, @NonNull String volumeName, long id,
-                int mediaType, boolean isDownload, String ownerPackage, String path);
+        /** Method invoked on database row delete. */
+        void onDelete(@NonNull DatabaseHelper helper, @NonNull FileRow deletedRow);
     }
 
     public interface OnLegacyMigrationListener {
@@ -360,10 +354,15 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 final boolean isDownload = Integer.parseInt(split[3]) != 0;
                 final boolean isPending = Integer.parseInt(split[4]) != 0;
 
+                FileRow insertedRow = FileRow.newBuilder(id)
+                        .setVolumeName(volumeName)
+                        .setMediaType(mediaType)
+                        .setIsDownload(isDownload)
+                        .setIsPending(isPending)
+                        .build();
                 Trace.beginSection("_INSERT");
                 try {
-                    mFilesListener.onInsert(DatabaseHelper.this, volumeName, id,
-                            mediaType, isDownload, isPending);
+                    mFilesListener.onInsert(DatabaseHelper.this, insertedRow);
                 } finally {
                     Trace.endSection();
                 }
@@ -393,13 +392,31 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 final String newOwnerPackage = split[16];
                 final String oldPath = split[17];
 
+                FileRow oldRow = FileRow.newBuilder(oldId)
+                        .setVolumeName(volumeName)
+                        .setMediaType(oldMediaType)
+                        .setIsDownload(oldIsDownload)
+                        .setIsTrashed(oldIsTrashed)
+                        .setIsPending(oldIsPending)
+                        .setIsFavorite(oldIsFavorite)
+                        .setSpecialFormat(oldSpecialFormat)
+                        .setOwnerPackageName(oldOwnerPackage)
+                        .setPath(oldPath)
+                        .build();
+                FileRow newRow = FileRow.newBuilder(newId)
+                        .setVolumeName(volumeName)
+                        .setMediaType(newMediaType)
+                        .setIsDownload(newIsDownload)
+                        .setIsTrashed(newIsTrashed)
+                        .setIsPending(newIsPending)
+                        .setIsFavorite(newIsFavorite)
+                        .setSpecialFormat(newSpecialFormat)
+                        .setOwnerPackageName(newOwnerPackage)
+                        .build();
+
                 Trace.beginSection("_UPDATE");
                 try {
-                    mFilesListener.onUpdate(DatabaseHelper.this, volumeName, oldId,
-                            oldMediaType, oldIsDownload, newId, newMediaType, newIsDownload,
-                            oldIsTrashed, newIsTrashed, oldIsPending, newIsPending,
-                            oldIsFavorite, newIsFavorite, oldSpecialFormat, newSpecialFormat,
-                            oldOwnerPackage, newOwnerPackage, oldPath);
+                    mFilesListener.onUpdate(DatabaseHelper.this, oldRow, newRow);
                 } finally {
                     Trace.endSection();
                 }
@@ -417,10 +434,16 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 final String ownerPackage = split[4];
                 final String path = split[5];
 
+                FileRow deletedRow = FileRow.newBuilder(id)
+                        .setVolumeName(volumeName)
+                        .setMediaType(mediaType)
+                        .setIsDownload(isDownload)
+                        .setOwnerPackageName(ownerPackage)
+                        .setPath(path)
+                        .build();
                 Trace.beginSection("_DELETE");
                 try {
-                    mFilesListener.onDelete(DatabaseHelper.this, volumeName, id,
-                            mediaType, isDownload, ownerPackage, path);
+                    mFilesListener.onDelete(DatabaseHelper.this, deletedRow);
                 } finally {
                     Trace.endSection();
                 }
@@ -492,6 +515,12 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     }
 
     private void tryRecoverRowIdSequence(SQLiteDatabase db) {
+        if (isInternal()) {
+            // Skip id reuse fix for internal db as it can lead to ids starting from a billion
+            // and can cause aberrant behaviour in Ringtones Manager. Reference: b/229153534.
+            Log.d(TAG, "Skipping next row id recovery for internal database.");
+            return;
+        }
         if (!isNextRowIdBackupEnabled()) {
             Log.d(TAG, "Skipping row id recovery as backup is not enabled.");
             return;
