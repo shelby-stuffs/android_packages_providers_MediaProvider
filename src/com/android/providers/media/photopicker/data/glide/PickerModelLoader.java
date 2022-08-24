@@ -16,6 +16,8 @@
 
 package com.android.providers.media.photopicker.data.glide;
 
+import static com.android.providers.media.photopicker.ui.ImageLoader.THUMBNAIL_REQUEST;
+
 import android.content.Context;
 import android.content.UriMatcher;
 import android.net.Uri;
@@ -39,15 +41,17 @@ public final class PickerModelLoader implements ModelLoader<Uri, ParcelFileDescr
     @Override
     public LoadData<ParcelFileDescriptor> buildLoadData(Uri model, int width, int height,
             Options options) {
+        final boolean isThumbRequest = Boolean.TRUE.equals(options.get(THUMBNAIL_REQUEST));
         return new LoadData<>(new ObjectKey(model),
-                new PickerThumbnailFetcher(mContext, model, width, height));
+                new PickerThumbnailFetcher(mContext, model, width, height, isThumbRequest));
     }
 
     @Override
     public boolean handles(Uri model) {
         final int pickerId = 1;
         final UriMatcher matcher = new UriMatcher(UriMatcher.NO_MATCH);
-        matcher.addURI(model.getAuthority(), CloudMediaProviderContract.URI_PATH_MEDIA, pickerId);
+        matcher.addURI(model.getAuthority(),
+                CloudMediaProviderContract.URI_PATH_MEDIA + "/*", pickerId);
 
         // Matches picker URIs of the form content://<authority>/media
         return matcher.match(model) == pickerId;

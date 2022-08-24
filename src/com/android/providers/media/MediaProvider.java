@@ -1062,13 +1062,22 @@ public class MediaProvider extends ContentProvider {
 
         mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME, false, false,
                 Column.class, ExportedSince.class, Metrics::logSchemaChange, mFilesListener,
-                MIGRATION_LISTENER, mIdGenerator);
+                MIGRATION_LISTENER, mIdGenerator, true);
         mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME, false, false,
                 Column.class, ExportedSince.class, Metrics::logSchemaChange, mFilesListener,
-                MIGRATION_LISTENER, mIdGenerator);
+                MIGRATION_LISTENER, mIdGenerator, true);
         mExternalDbFacade = new ExternalDbFacade(getContext(), mExternalDatabase, mVolumeCache);
         mPickerDbFacade = new PickerDbFacade(context);
-        mPickerSyncController = new PickerSyncController(context, mPickerDbFacade, this);
+
+        final String localPickerProvider = PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY;
+        final String allowedCloudProviders =
+                getStringDeviceConfig(PickerSyncController.ALLOWED_CLOUD_PROVIDERS_KEY,
+                        /* default */ "");
+        final int pickerSyncDelayMs = getIntDeviceConfig(PickerSyncController.SYNC_DELAY_MS,
+                /* default */ 5000);
+
+        mPickerSyncController = new PickerSyncController(context, mPickerDbFacade,
+                localPickerProvider, allowedCloudProviders, pickerSyncDelayMs);
         mPickerDataLayer = new PickerDataLayer(context, mPickerDbFacade, mPickerSyncController);
         mPickerUriResolver = new PickerUriResolver(context, mPickerDbFacade);
 
@@ -4751,9 +4760,15 @@ public class MediaProvider extends ContentProvider {
                 } else if (isCallingPackageManager()) {
                     // Apps with MANAGE_EXTERNAL_STORAGE have all files access, hence they are
                     // allowed to insert files anywhere.
+                } else if (getCallingPackageTargetSdkVersion() >=
+                        Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    // Throwing an exception so that it doesn't result in some unexpected
+                    // behavior for apps and make them aware of what is happening.
+                    throw new IllegalArgumentException("Mutation of " + column
+                        + " is not allowed.");
                 } else {
                     Log.w(TAG, "Ignoring mutation of  " + column + " from "
-                            + getCallingPackageOrSelf());
+                        + getCallingPackageOrSelf());
                     initialValues.remove(column);
                 }
             }
@@ -6333,12 +6348,9 @@ public class MediaProvider extends ContentProvider {
             case MediaStore.SET_CLOUD_PROVIDER_CALL: {
                 // TODO(b/190713331): Remove after initial development
                 final String cloudProvider = extras.getString(MediaStore.EXTRA_CLOUD_PROVIDER);
-                Log.i(TAG, "Developer initiated cloud provider switch: " + cloudProvider);
-                if (mPickerSyncController.setCloudProvider(cloudProvider)
-                        && SdkLevel.isAtLeastT()) {
-                    mStorageManager.setCloudMediaProvider(cloudProvider);
-                }
-                // fall through
+                Log.i(TAG, "Test initiated cloud provider switch: " + cloudProvider);
+                mPickerSyncController.forceSetCloudProvider(cloudProvider);
+                // fall-through
             }
             case MediaStore.SYNC_PROVIDERS_CALL: {
                 syncAllMedia();
@@ -6374,6 +6386,20 @@ public class MediaProvider extends ContentProvider {
                         notifyCloudEventResult);
                 return bundle;
             }
+            case MediaStore.USES_FUSE_PASSTHROUGH: {
+                boolean isEnabled = false;
+                try {
+                    FuseDaemon daemon = getFuseDaemonForFile(new File(arg));
+                    if (daemon != null) {
+                        isEnabled = daemon.usesFusePassthrough();
+                    }
+                } catch (FileNotFoundException e) {
+                }
+
+                Bundle bundle = new Bundle();
+                bundle.putBoolean(MediaStore.USES_FUSE_PASSTHROUGH_RESULT, isEnabled);
+                return bundle;
+            }
             default:
                 throw new UnsupportedOperationException("Unsupported call: " + method);
         }
@@ -6384,8 +6410,7 @@ public class MediaProvider extends ContentProvider {
         // local_provider while running as MediaProvider
         final long t = Binder.clearCallingIdentity();
         try {
-            // TODO(b/190713331): Remove after initial development
-            Log.v(TAG, "Developer initiated provider sync");
+            Log.v(TAG, "Test initiated cloud provider sync");
             mPickerSyncController.syncAllMedia();
         } finally {
             Binder.restoreCallingIdentity(t);

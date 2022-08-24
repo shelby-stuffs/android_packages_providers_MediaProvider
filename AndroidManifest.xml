@@ -182,8 +182,8 @@
             android:targetActivity="com.android.providers.media.photopicker.PhotoPickerActivity"
             android:exported="true"
             android:excludeFromRecents="true"
-            android:enabled="false">
-            <intent-filter>
+            android:enabled="true">
+            <intent-filter android:priority="101" >
                 <action android:name="android.intent.action.GET_CONTENT" />
                 <category android:name="android.intent.category.OPENABLE" />
                 <category android:name="android.intent.category.DEFAULT" />
