@@ -471,8 +471,13 @@ public class MediaProvider extends ContentProvider {
         List<UserHandle> users = mUserCache.getUsersCached();
         ArrayList<File> allowedPaths = new ArrayList<>();
         for (UserHandle user : users) {
-            Collection<File> volumeScanPaths = mVolumeCache.getVolumeScanPaths(volumeName, user);
-            allowedPaths.addAll(volumeScanPaths);
+            try {
+                Collection<File> volumeScanPaths = mVolumeCache.getVolumeScanPaths(volumeName,
+                        user);
+                allowedPaths.addAll(volumeScanPaths);
+            } catch (FileNotFoundException e) {
+                Log.e(TAG, volumeName + " has no associated path for user: " + user);
+            }
         }
 
         return allowedPaths;
@@ -627,6 +632,7 @@ public class MediaProvider extends ContentProvider {
                         if (Intent.ACTION_PACKAGE_REMOVED.equals(intent.getAction())) {
                             mUserCache.invalidateWorkProfileOwnerApps(pkg);
                             mPickerSyncController.notifyPackageRemoval(pkg);
+                            invalidateDentryForExternalStorage(pkg);
                         }
                     } else {
                         Log.w(TAG, "Failed to retrieve package from intent: " + intent.getAction());
@@ -635,6 +641,18 @@ public class MediaProvider extends ContentProvider {
             }
         }
     };
+
+    private void invalidateDentryForExternalStorage(String packageName) {
+        for (MediaVolume vol : mVolumeCache.getExternalVolumes()) {
+            try {
+                invalidateFuseDentry(String.format(Locale.ROOT,
+                        "%s/Android/media/%s/", getVolumePath(vol.getName()).getAbsolutePath(),
+                        packageName));
+            } catch (FileNotFoundException e) {
+                Log.e(TAG, "External volume path not found for " + vol.getName(), e);
+            }
+        }
+    }
 
     private BroadcastReceiver mUserIntentReceiver = new BroadcastReceiver() {
         @Override
@@ -740,7 +758,7 @@ public class MediaProvider extends ContentProvider {
                     insertedRow.getId(), insertedRow.getMediaType(), insertedRow.isDownload());
             updateNextRowIdXattr(helper, insertedRow.getId());
             helper.postBackground(() -> {
-                if (helper.isExternal()) {
+                if (helper.isExternal() && !isFuseThread()) {
                     // Update the quota type on the filesystem
                     Uri fileUri = MediaStore.Files.getContentUri(insertedRow.getVolumeName(),
                             insertedRow.getId());
@@ -1989,6 +2007,8 @@ public class MediaProvider extends ContentProvider {
         }
     }
 
+    /** TODO(b/242153950) :Add negative tests for permission check of file lookup of synthetic
+     * paths. */
     private FileLookupResult handlePickerFileLookup(int userId, int uid, @NonNull String path) {
         final File file = new File(path);
         final List<String> syntheticRelativePathSegments =
@@ -2033,7 +2053,8 @@ public class MediaProvider extends ContentProvider {
                 // .../picker/<user-id>/<authority>/media/<media-id.extension>
                 final String fileUserId = syntheticRelativePathSegments.get(1);
                 final String authority = syntheticRelativePathSegments.get(2);
-                result = preparePickerMediaIdPathSegment(file, authority, lastSegment, fileUserId);
+                result = preparePickerMediaIdPathSegment(file, authority, lastSegment, fileUserId,
+                        uid);
                 break;
         }
 
@@ -2106,14 +2127,13 @@ public class MediaProvider extends ContentProvider {
     }
 
     private boolean preparePickerMediaIdPathSegment(File file, String authority, String fileName,
-            String userId) {
+            String userId, int uid) {
         final String mediaId = extractFileName(fileName);
         final String[] projection = new String[] { MediaStore.PickerMediaColumns.SIZE };
 
         final Uri uri = Uri.parse("content://media/picker/" + userId + "/" + authority + "/media/"
                 + mediaId);
-        try (Cursor cursor =  mPickerUriResolver.query(uri, projection, /* callingUid */0,
-                android.os.Process.myUid())) {
+        try (Cursor cursor = mPickerUriResolver.query(uri, projection, /* callingPid */0, uid)) {
             if (cursor != null && cursor.moveToFirst()) {
                 final int sizeBytesIdx = cursor.getColumnIndex(MediaStore.PickerMediaColumns.SIZE);
 
@@ -2661,9 +2681,18 @@ public class MediaProvider extends ContentProvider {
         boolean allowHidden = isCallingPackageAllowedHidden();
         final SQLiteQueryBuilder qbForUpdate = getQueryBuilder(TYPE_UPDATE,
                 matchUri(uriOldPath, allowHidden), uriOldPath, qbExtras, null);
+
+        // uriOldPath may use Files uri which doesn't allow modifying AudioColumns. Include
+        // AudioColumns projection map if we are modifying any audio columns while renaming
+        // database rows.
+        if (values.containsKey(AudioColumns.IS_RINGTONE)) {
+            qbForUpdate.setProjectionMap(getProjectionMap(AudioColumns.class, FileColumns.class));
+        }
+
         if (values.containsKey(FileColumns._MODIFIER)) {
             qbForUpdate.allowColumn(FileColumns._MODIFIER);
         }
+
         final String selection = MediaColumns.DATA + " =? ";
         int count = 0;
         boolean retryUpdateWithReplace = false;
@@ -2736,12 +2765,12 @@ public class MediaProvider extends ContentProvider {
             values.put(FileColumns._MODIFIER, FileColumns._MODIFIER_FUSE);
         }
 
-        final boolean allowHidden = isCallingPackageAllowedHidden();
-        if (!newMimeType.equalsIgnoreCase("null") &&
-                matchUri(getContentUriForFile(path, newMimeType), allowHidden) == AUDIO_MEDIA) {
+        if (MimeUtils.isAudioMimeType(newMimeType) && !values.containsKey(FileColumns._MODIFIER)) {
             computeAudioLocalizedValues(values);
             computeAudioKeyValues(values);
+            FileUtils.computeAudioTypeValuesFromData(path, values::put);
         }
+
         FileUtils.computeValuesFromData(values, isFuseThread());
         return values;
     }
@@ -7387,14 +7416,14 @@ public class MediaProvider extends ContentProvider {
                                 helper.postBackground(() -> {
                                     scanFileAsMediaProvider(file, REASON_DEMAND);
                                     if (notifyTranscodeHelper) {
-                                        notifyTranscodeHelperOnUriPublished(updatedUri);
+                                        notifyTranscodeHelperOnUriPublished(updatedUri, file);
                                     }
                                 });
                             } else {
                                 helper.postBlocking(() -> {
                                     scanFileAsMediaProvider(file, REASON_DEMAND);
                                     if (notifyTranscodeHelper) {
-                                        notifyTranscodeHelperOnUriPublished(updatedUri);
+                                        notifyTranscodeHelperOnUriPublished(updatedUri, file);
                                     }
                                 });
                             }
@@ -7448,7 +7477,11 @@ public class MediaProvider extends ContentProvider {
         return isSrcUpdateAllowed && isDestUpdateAllowed;
     }
 
-    private void notifyTranscodeHelperOnUriPublished(Uri uri) {
+    private void notifyTranscodeHelperOnUriPublished(Uri uri, File file) {
+        if (!mTranscodeHelper.supportsTranscode(file.getPath())) {
+            return;
+        }
+
         BackgroundThread.getExecutor().execute(() -> {
             final LocalCallingIdentity token = clearLocalCallingIdentity();
             try {
@@ -7461,6 +7494,10 @@ public class MediaProvider extends ContentProvider {
 
     private void notifyTranscodeHelperOnFileOpen(String path, String ioPath, int uid,
             int transformsReason) {
+        if (!mTranscodeHelper.supportsTranscode(path)) {
+            return;
+        }
+
         BackgroundThread.getExecutor().execute(() -> {
             final LocalCallingIdentity token = clearLocalCallingIdentity();
             try {
@@ -8321,10 +8358,9 @@ public class MediaProvider extends ContentProvider {
             requireOwnershipForItem(ownerPackageName, uri);
         }
 
-        final boolean callerIsOwner = Objects.equals(getCallingPackageOrSelf(), ownerPackageName);
         // Figure out if we need to redact contents
-        final boolean redactionNeeded =
-                (redactedUri != null) || (!callerIsOwner && isRedactionNeeded(uri));
+        final boolean redactionNeeded = isRedactionNeededForOpenViaContentResolver(redactedUri,
+                ownerPackageName, file);
         final RedactionInfo redactionInfo;
         try {
             redactionInfo = redactionNeeded ? getRedactionRanges(file)
@@ -8442,6 +8478,27 @@ public class MediaProvider extends ContentProvider {
         }
     }
 
+    private boolean isRedactionNeededForOpenViaContentResolver(Uri redactedUri,
+            String ownerPackageName, File file) {
+        // Redacted Uris should always redact information
+        if (redactedUri != null) {
+            return true;
+        }
+
+        final boolean callerIsOwner = Objects.equals(getCallingPackageOrSelf(), ownerPackageName);
+        if (callerIsOwner) {
+            return false;
+        }
+
+        // To be consistent with FUSE redaction checks we allow similar access for File Manager
+        // and System Gallery apps.
+        if (isCallingPackageManager() || canSystemGalleryAccessTheFile(file.getPath())) {
+            return false;
+        }
+
+        return isRedactionNeeded();
+    }
+
     private void deleteAndInvalidate(@NonNull Path path) {
         deleteAndInvalidate(path.toFile());
     }
@@ -8453,7 +8510,7 @@ public class MediaProvider extends ContentProvider {
 
     private void deleteIfAllowed(Uri uri, Bundle extras, String path) {
         try {
-            final File file = new File(path);
+            final File file = new File(path).getCanonicalFile();
             checkAccess(uri, extras, file, true);
             deleteAndInvalidate(file);
         } catch (Exception e) {
@@ -8532,7 +8589,7 @@ public class MediaProvider extends ContentProvider {
      * Returns true if:
      * <ul>
      * <li>the calling identity is an app targeting Q or older versions AND is requesting legacy
-     * storage
+     * storage and has the corresponding legacy access (read/write) permissions
      * <li>the calling identity holds {@code MANAGE_EXTERNAL_STORAGE}
      * <li>the calling identity owns or has access to the filePath (eg /Android/data/com.foo)
      * <li>the calling identity has permission to write images and the given file is an image file
@@ -10709,6 +10766,37 @@ public class MediaProvider extends ContentProvider {
         mTranscodeHelper.dump(writer);
         writer.println();
 
+        dumpNoMedia(writer);
+        writer.println();
+
         Logging.dumpPersistent(writer);
+    }
+
+    private void dumpNoMedia(PrintWriter writer) {
+        final DatabaseHelper helper;
+        try {
+            helper = getDatabaseForUri(MediaStore.Files.EXTERNAL_CONTENT_URI);
+        } catch (VolumeNotFoundException e) {
+            Log.w(TAG, "Volume not found", e);
+            return;
+        }
+
+        writer.println(MediaStore.VOLUME_EXTERNAL + " nomedia files:");
+        final int noMediaDumpFrequency = 100;
+
+        try (Cursor cursor = helper.runWithoutTransaction(
+                db -> db.query("files", new String[]{FileColumns.DATA},
+                        FileColumns.DATA + " LIKE '%.nomedia'", null, null, null, null))) {
+            final int dataColumnIndex = cursor.getColumnIndex(FileColumns.DATA);
+            final StringBuilder nomediaPaths = new StringBuilder();
+            while (cursor.moveToNext()) {
+                nomediaPaths.append(cursor.getString(dataColumnIndex)).append("\n");
+                if (cursor.getPosition() % noMediaDumpFrequency == 0) {
+                    writer.print(nomediaPaths);
+                    nomediaPaths.setLength(0);
+                }
+            }
+            writer.println(nomediaPaths);
+        }
     }
 }
