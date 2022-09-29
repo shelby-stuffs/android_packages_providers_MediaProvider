@@ -35,6 +35,7 @@ import static android.provider.MediaStore.MATCH_DEFAULT;
 import static android.provider.MediaStore.MATCH_EXCLUDE;
 import static android.provider.MediaStore.MATCH_INCLUDE;
 import static android.provider.MediaStore.MATCH_ONLY;
+import static android.provider.MediaStore.MEDIA_IGNORE_FILENAME;
 import static android.provider.MediaStore.MY_UID;
 import static android.provider.MediaStore.PER_USER_RANGE;
 import static android.provider.MediaStore.QUERY_ARG_DEFER_SCAN;
@@ -43,7 +44,6 @@ import static android.provider.MediaStore.QUERY_ARG_MATCH_PENDING;
 import static android.provider.MediaStore.QUERY_ARG_MATCH_TRASHED;
 import static android.provider.MediaStore.QUERY_ARG_REDACTED_URI;
 import static android.provider.MediaStore.QUERY_ARG_RELATED_URI;
-import static android.provider.MediaStore.VOLUME_EXTERNAL;
 import static android.provider.MediaStore.getVolumeName;
 import static android.system.OsConstants.F_GETFL;
 
@@ -121,6 +121,7 @@ import android.compat.annotation.EnabledAfter;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipDescription;
+import android.content.ComponentName;
 import android.content.ContentProvider;
 import android.content.ContentProviderClient;
 import android.content.ContentProviderOperation;
@@ -225,6 +226,7 @@ import com.android.providers.media.dao.FileRow;
 import com.android.providers.media.fuse.ExternalStorageServiceImpl;
 import com.android.providers.media.fuse.FuseDaemon;
 import com.android.providers.media.metrics.PulledMetrics;
+import com.android.providers.media.photopicker.PhotoPickerActivity;
 import com.android.providers.media.photopicker.PickerDataLayer;
 import com.android.providers.media.photopicker.PickerSyncController;
 import com.android.providers.media.photopicker.data.ExternalDbFacade;
@@ -341,6 +343,8 @@ public class MediaProvider extends ContentProvider {
 
     private static final String DIRECTORY_MEDIA = "media";
     private static final String DIRECTORY_THUMBNAILS = ".thumbnails";
+
+    private static final String TAKE_OVER_GET_CONTENT = "take_over_get_content";
 
     /**
      * Hard-coded filename where the current value of
@@ -848,15 +852,16 @@ public class MediaProvider extends ContentProvider {
 
         Optional<Long> nextRowIdBackupOptional = helper.getNextRowId();
         if (!nextRowIdBackupOptional.isPresent()) {
-            throw new RuntimeException(String.format("Cannot find next row id xattr for %s.",
-                    helper.getDatabaseName()));
+            throw new RuntimeException(
+                    String.format(Locale.ROOT, "Cannot find next row id xattr for %s.",
+                            helper.getDatabaseName()));
         }
 
         if (id >= nextRowIdBackupOptional.get()) {
             helper.backupNextRowId(id);
         } else {
-            Log.v(TAG, String.format("Inserted id:%d less than next row id backup:%d.", id,
-                    nextRowIdBackupOptional.get()));
+            Log.v(TAG, String.format(Locale.ROOT, "Inserted id:%d less than next row id backup:%d.",
+                    id, nextRowIdBackupOptional.get()));
         }
     }
 
@@ -1062,13 +1067,22 @@ public class MediaProvider extends ContentProvider {
 
         mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME, false, false,
                 Column.class, ExportedSince.class, Metrics::logSchemaChange, mFilesListener,
-                MIGRATION_LISTENER, mIdGenerator);
+                MIGRATION_LISTENER, mIdGenerator, true);
         mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME, false, false,
                 Column.class, ExportedSince.class, Metrics::logSchemaChange, mFilesListener,
-                MIGRATION_LISTENER, mIdGenerator);
+                MIGRATION_LISTENER, mIdGenerator, true);
         mExternalDbFacade = new ExternalDbFacade(getContext(), mExternalDatabase, mVolumeCache);
         mPickerDbFacade = new PickerDbFacade(context);
-        mPickerSyncController = new PickerSyncController(context, mPickerDbFacade, this);
+
+        final String localPickerProvider = PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY;
+        final String allowedCloudProviders =
+                getStringDeviceConfig(PickerSyncController.ALLOWED_CLOUD_PROVIDERS_KEY,
+                        /* default */ "");
+        final int pickerSyncDelayMs = getIntDeviceConfig(PickerSyncController.SYNC_DELAY_MS,
+                /* default */ 5000);
+
+        mPickerSyncController = new PickerSyncController(context, mPickerDbFacade,
+                localPickerProvider, allowedCloudProviders, pickerSyncDelayMs);
         mPickerDataLayer = new PickerDataLayer(context, mPickerDbFacade, mPickerSyncController);
         mPickerUriResolver = new PickerUriResolver(context, mPickerDbFacade);
 
@@ -1171,8 +1185,27 @@ public class MediaProvider extends ContentProvider {
             mExternalStorageAuthorityAppId = UserHandle.getAppId(provider.applicationInfo.uid);
         }
 
+        checkDeviceConfigAndUpdateGetContentAlias();
+
         PulledMetrics.initialize(context);
         return true;
+    }
+
+    @VisibleForTesting
+    protected void checkDeviceConfigAndUpdateGetContentAlias() {
+        final String photoPickerGetContentActivity =
+                PhotoPickerActivity.class.getPackage().getName() + ".PhotoPickerGetContentActivity";
+        final ComponentName componentName = new ComponentName(getContext().getPackageName(),
+                photoPickerGetContentActivity);
+
+        final int expectedState = getBooleanDeviceConfig(TAKE_OVER_GET_CONTENT, false)
+                ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                : PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
+
+        Log.i(TAG, "Change component enabled state to " + expectedState
+                + " for PhotoPickerGetContentActivity. ");
+        getContext().getPackageManager().setComponentEnabledSetting(componentName, expectedState,
+                PackageManager.DONT_KILL_APP);
     }
 
     Optional<DatabaseHelper> getDatabaseHelper(String dbName) {
@@ -1279,7 +1312,8 @@ public class MediaProvider extends ContentProvider {
         // Cleaning media files for users that have been removed
         cleanMediaFilesForRemovedUser(signal);
 
-        // Populate _SPECIAL_FORMAT column for files which have column value as NULL
+        // Calculate standard_mime_type_extension column for files which have SPECIAL_FORMAT column
+        // value as NULL, and update the same in the picker db
         detectSpecialFormat(signal);
 
         final long durationMillis = (SystemClock.elapsedRealtime() - startTime);
@@ -1393,9 +1427,14 @@ public class MediaProvider extends ContentProvider {
     private void updateSpecialFormatColumn(SQLiteDatabase db, @NonNull CancellationSignal signal) {
         // This is to ensure we only do a bounded iteration over the rows as updates can fail, and
         // we don't want to keep running the query/update indefinitely.
-        final int totalRowsToUpdate = getPendingSpecialFormatRowsCount(db,signal);
-        for (int i = 0 ; i < totalRowsToUpdate ; i += IDLE_MAINTENANCE_ROWS_LIMIT) {
-            updateSpecialFormatForLimitedRows(db, signal);
+        final int totalRowsToUpdate = getPendingSpecialFormatRowsCount(db, signal);
+        for (int i = 0; i < totalRowsToUpdate; i += IDLE_MAINTENANCE_ROWS_LIMIT) {
+            try (PickerDbFacade.UpdateMediaOperation operation =
+                         mPickerDbFacade.beginUpdateMediaOperation(
+                                 PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY)) {
+                updateSpecialFormatForLimitedRows(db, signal, operation);
+                operation.setSuccess();
+            }
         }
     }
 
@@ -1409,14 +1448,12 @@ public class MediaProvider extends ContentProvider {
         }
     }
 
-    private void updateSpecialFormatForLimitedRows(SQLiteDatabase db,
-            @NonNull CancellationSignal signal) {
-        final SQLiteQueryBuilder qbForUpdate = getQueryBuilder(TYPE_UPDATE, FILES,
-                Files.getContentUri(VOLUME_EXTERNAL), Bundle.EMPTY, null);
+    private void updateSpecialFormatForLimitedRows(SQLiteDatabase externalDb,
+            @NonNull CancellationSignal signal, PickerDbFacade.UpdateMediaOperation operation) {
         // Accumulate all the new SPECIAL_FORMAT updates with their ids
         ArrayMap<Long, Integer> newSpecialFormatValues = new ArrayMap<>();
         final String limit = String.valueOf(IDLE_MAINTENANCE_ROWS_LIMIT);
-        try (Cursor c = queryForPendingSpecialFormatColumns(db, limit, signal)) {
+        try (Cursor c = queryForPendingSpecialFormatColumns(externalDb, limit, signal)) {
             while (c.moveToNext() && !signal.isCanceled()) {
                 final long id = c.getLong(0);
                 final String path = c.getString(1);
@@ -1424,25 +1461,35 @@ public class MediaProvider extends ContentProvider {
             }
         }
 
-        // Now, update all the new SPECIAL_FORMAT values.
-        final ContentValues values = new ContentValues();
+        // Now, update all the new SPECIAL_FORMAT values in both external db and picker db.
+        final ContentValues pickerDbValues = new ContentValues();
+        final ContentValues externalDbValues = new ContentValues();
         int count = 0;
-        for (long id: newSpecialFormatValues.keySet()) {
+        for (long id : newSpecialFormatValues.keySet()) {
             if (signal.isCanceled()) {
                 return;
             }
 
-            values.clear();
-            values.put(_SPECIAL_FORMAT, newSpecialFormatValues.get(id));
-            final String selection = MediaColumns._ID + "=?";
-            final String[] selectionArgs = new String[]{String.valueOf(id)};
-            if (qbForUpdate.update(db, values, selection, selectionArgs) == 1) {
+            int specialFormat = newSpecialFormatValues.get(id);
+
+            pickerDbValues.clear();
+            pickerDbValues.put(PickerDbFacade.KEY_STANDARD_MIME_TYPE_EXTENSION, specialFormat);
+            boolean pickerDbWriteSuccess = operation.execute(String.valueOf(id), pickerDbValues);
+
+            externalDbValues.clear();
+            externalDbValues.put(_SPECIAL_FORMAT, specialFormat);
+            final String externalDbSelection = MediaColumns._ID + "=?";
+            final String[] externalDbSelectionArgs = new String[]{String.valueOf(id)};
+            boolean externalDbWriteSuccess =
+                    externalDb.update("files", externalDbValues, externalDbSelection,
+                            externalDbSelectionArgs)
+                            == 1;
+
+            if (pickerDbWriteSuccess && externalDbWriteSuccess) {
                 count++;
-            } else {
-                Log.e(TAG, "Unable to update _SPECIAL_FORMAT for id = " + id);
             }
         }
-        Log.d(TAG, "Updated _SPECIAL_FORMAT for " + count + " items");
+        Log.d(TAG, "Updated standard_mime_type_extension for " + count + " items");
     }
 
     private int getSpecialFormatValue(String path) {
@@ -3095,27 +3142,31 @@ public class MediaProvider extends ContentProvider {
                 return OsConstants.EPERM;
             }
 
-            // TODO(b/177049768): We shouldn't use getExternalStorageDirectory for these checks.
-            final File directoryAndroid = new File(Environment.getExternalStorageDirectory(),
-                    DIRECTORY_ANDROID_LOWER_CASE);
+            final File directoryAndroid = new File(
+                    extractVolumePath(oldPath).toLowerCase(Locale.ROOT),
+                    DIRECTORY_ANDROID_LOWER_CASE
+            );
             final File directoryAndroidMedia = new File(directoryAndroid, DIRECTORY_MEDIA);
+            String newPathLowerCase = newPath.toLowerCase(Locale.ROOT);
             if (directoryAndroidMedia.getAbsolutePath().equalsIgnoreCase(oldPath)) {
                 // Don't allow renaming 'Android/media' directory.
                 // Android/[data|obb] are bind mounted and these paths don't go through FUSE.
                 Log.e(TAG, errorMessage +  oldPath + " is a default folder in app external "
                         + "directory. Renaming a default folder is not allowed.");
                 return OsConstants.EPERM;
-            } else if (FileUtils.contains(directoryAndroid, new File(newPath))) {
-                if (newRelativePath.length == 1) {
-                    // New path is Android/*. Path is directly under Android. Don't allow moving
-                    // files and directories to Android/.
+            } else if (FileUtils.contains(directoryAndroid, new File(newPathLowerCase))) {
+                if (newRelativePath.length <= 2) {
+                    // Path is directly under Android, Android/media, Android/data, Android/obb or
+                    // some other directory under Android. Don't allow moving files and directories
+                    // in these paths. Files and directories are only allowed to move to path
+                    // Android/media/<app_specific_directory>/*
                     Log.e(TAG, errorMessage +  newPath + " is in app external directory. "
                             + "Renaming a file/directory to app external directory is not "
                             + "allowed.");
                     return OsConstants.EPERM;
-                } else if(!FileUtils.contains(directoryAndroidMedia, new File(newPath))) {
-                    // New path is  Android/*/*. Don't allow moving of files or directories
-                    // to app external directory other than media directory.
+                } else if (!FileUtils.contains(directoryAndroidMedia, new File(newPathLowerCase))) {
+                    // New path is not in Android/media/*. Don't allow moving of files or
+                    // directories to app external directory other than media directory.
                     Log.e(TAG, errorMessage +  newPath + " is not in external media directory."
                             + "File/directory can only be renamed to a path in external media "
                             + "directory. Renaming file/directory to path in other external "
@@ -4751,9 +4802,15 @@ public class MediaProvider extends ContentProvider {
                 } else if (isCallingPackageManager()) {
                     // Apps with MANAGE_EXTERNAL_STORAGE have all files access, hence they are
                     // allowed to insert files anywhere.
+                } else if (getCallingPackageTargetSdkVersion() >=
+                        Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    // Throwing an exception so that it doesn't result in some unexpected
+                    // behavior for apps and make them aware of what is happening.
+                    throw new IllegalArgumentException("Mutation of " + column
+                        + " is not allowed.");
                 } else {
                     Log.w(TAG, "Ignoring mutation of  " + column + " from "
-                            + getCallingPackageOrSelf());
+                        + getCallingPackageOrSelf());
                     initialValues.remove(column);
                 }
             }
@@ -6333,12 +6390,9 @@ public class MediaProvider extends ContentProvider {
             case MediaStore.SET_CLOUD_PROVIDER_CALL: {
                 // TODO(b/190713331): Remove after initial development
                 final String cloudProvider = extras.getString(MediaStore.EXTRA_CLOUD_PROVIDER);
-                Log.i(TAG, "Developer initiated cloud provider switch: " + cloudProvider);
-                if (mPickerSyncController.setCloudProvider(cloudProvider)
-                        && SdkLevel.isAtLeastT()) {
-                    mStorageManager.setCloudMediaProvider(cloudProvider);
-                }
-                // fall through
+                Log.i(TAG, "Test initiated cloud provider switch: " + cloudProvider);
+                mPickerSyncController.forceSetCloudProvider(cloudProvider);
+                // fall-through
             }
             case MediaStore.SYNC_PROVIDERS_CALL: {
                 syncAllMedia();
@@ -6374,6 +6428,20 @@ public class MediaProvider extends ContentProvider {
                         notifyCloudEventResult);
                 return bundle;
             }
+            case MediaStore.USES_FUSE_PASSTHROUGH: {
+                boolean isEnabled = false;
+                try {
+                    FuseDaemon daemon = getFuseDaemonForFile(new File(arg));
+                    if (daemon != null) {
+                        isEnabled = daemon.usesFusePassthrough();
+                    }
+                } catch (FileNotFoundException e) {
+                }
+
+                Bundle bundle = new Bundle();
+                bundle.putBoolean(MediaStore.USES_FUSE_PASSTHROUGH_RESULT, isEnabled);
+                return bundle;
+            }
             default:
                 throw new UnsupportedOperationException("Unsupported call: " + method);
         }
@@ -6384,8 +6452,7 @@ public class MediaProvider extends ContentProvider {
         // local_provider while running as MediaProvider
         final long t = Binder.clearCallingIdentity();
         try {
-            // TODO(b/190713331): Remove after initial development
-            Log.v(TAG, "Developer initiated provider sync");
+            Log.v(TAG, "Test initiated cloud provider sync");
             mPickerSyncController.syncAllMedia();
         } finally {
             Binder.restoreCallingIdentity(t);
@@ -6633,6 +6700,7 @@ public class MediaProvider extends ContentProvider {
                 final File[] files = thumbDir.listFiles();
                 for (File thumbFile : (files != null) ? files : new File[0]) {
                     if (Objects.equals(thumbFile.getName(), FILE_DATABASE_UUID)) continue;
+                    if (Objects.equals(thumbFile.getName(), MEDIA_IGNORE_FILENAME)) continue;
                     final String name = FileUtils.extractFileName(thumbFile.getName());
                     try {
                         final long id = Long.parseLong(name);
@@ -7774,8 +7842,6 @@ public class MediaProvider extends ContentProvider {
     }
 
     private boolean isPickerUri(Uri uri) {
-        // TODO(b/188394433): move this method to PickerResolver in the spirit of not
-        // adding picker logic to MediaProvider
         final int match = matchUri(uri, /* allowHidden */ isCallingPackageAllowedHidden());
         return match == PICKER_ID;
     }
@@ -7892,7 +7958,15 @@ public class MediaProvider extends ContentProvider {
             // level from #3
             // 5. Return the fd from #4 to the app or throw an exception if any of the conditions
             // are not met
-            return getOriginalMediaFormatFileDescriptor(opts);
+            try {
+                return getOriginalMediaFormatFileDescriptor(opts);
+            } finally {
+                // Clearing the Bundle closes the underlying Parcel, ensuring that the input fd
+                // owned by the Parcel is closed immediately and not at the next GC.
+                // This works around a change in behavior introduced by:
+                // aosp/Icfe8880cad00c3cd2afcbe4b92400ad4579e680e
+                opts.clear();
+            }
         }
 
         // This is needed for thumbnail resolution as it doesn't go through openFileCommon

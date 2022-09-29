@@ -119,8 +119,10 @@ public class PickerDataLayerTest {
 
         mDbHelper = new PickerDatabaseHelper(mContext, DB_NAME, DB_VERSION_1);
         mFacade = new PickerDbFacade(mContext, LOCAL_PROVIDER_AUTHORITY, mDbHelper);
+        final String allowedCloudProviders = CLOUD_PRIMARY_PROVIDER_AUTHORITY + ","
+                + CLOUD_SECONDARY_PROVIDER_AUTHORITY;
         mController = new PickerSyncController(mContext, mFacade, LOCAL_PROVIDER_AUTHORITY,
-                /* syncDelay */ 0);
+                allowedCloudProviders, /* syncDelay */ 0);
         mDataLayer = new PickerDataLayer(mContext, mFacade, mController);
 
         // Set cloud provider to null to discard
@@ -557,7 +559,9 @@ public class PickerDataLayerTest {
     private static Bundle buildQueryArgs(String mimeType, long sizeBytes) {
         final Bundle queryArgs = new Bundle();
 
-        queryArgs.putString(MediaStore.QUERY_ARG_MIME_TYPE, mimeType);
+        if (mimeType != null) {
+            queryArgs.putStringArray(MediaStore.QUERY_ARG_MIME_TYPE, new String[]{mimeType});
+        }
         queryArgs.putLong(MediaStore.QUERY_ARG_SIZE_BYTES, sizeBytes);
 
         return queryArgs;

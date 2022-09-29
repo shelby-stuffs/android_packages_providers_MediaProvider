@@ -23,6 +23,25 @@ android_test_helper_app {
 }
 
 android_test_helper_app {
+    name: "MediaProviderTestAppForPermissionActivity33",
+    manifest: "test_app/TestAppForPermissionActivity33.xml",
+    srcs: [
+        "test_app/src/**/*.java",
+        "src/com/android/providers/media/util/TestUtils.java",
+    ],
+    static_libs: [
+        "cts-install-lib",
+    ],
+    sdk_version: "test_current",
+    target_sdk_version: "33",
+    min_sdk_version: "30",
+    test_suites: [
+        "general-tests",
+        "mts-mediaprovider",
+    ],
+}
+
+android_test_helper_app {
     name: "MediaProviderTestAppWithStoragePerms",
     manifest: "test_app/TestAppWithStoragePerms.xml",
     srcs: [
@@ -139,7 +158,7 @@ android_test {
         "androidx.core_core",
         "androidx.test.rules",
         "guava",
-        "mockito-target-extended-minus-junit4",
+        "mockito-target",
         "modules-utils-build",
         "truth-prebuilt",
         "com.google.android.material_material",
@@ -158,12 +177,6 @@ android_test {
         "exoplayer-mediaprovider-ui",
     ],
 
-    // these are needed for Extended Mockito
-    jni_libs: [
-        "libdexmakerjvmtiagent",
-        "libstaticjvmtiagent",
-    ],
-
     certificate: "media",
 
     aaptflags: ["--custom-package com.android.providers.media"],
@@ -180,6 +193,7 @@ android_test {
         ":MediaProviderTestAppWithMediaPerms",
         ":MediaProviderTestAppWithoutPerms",
         ":MediaProviderTestAppForPermissionActivity",
+        ":MediaProviderTestAppForPermissionActivity33",
         ":LegacyMediaProviderTestApp",
     ],
 

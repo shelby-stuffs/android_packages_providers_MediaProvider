@@ -87,6 +87,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -115,22 +116,26 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     /**
      * Key name of xattr used to set next row id for internal DB.
      */
-    private static final String INTERNAL_DB_NEXT_ROW_ID_XATTR_KEY = "user.intdbnextrowid";
+    private static final String INTERNAL_DB_NEXT_ROW_ID_XATTR_KEY = "user.intdbnextrowid".concat(
+            String.valueOf(UserHandle.myUserId()));
 
     /**
      * Key name of xattr used to set next row id for external DB.
      */
-    private static final String EXTERNAL_DB_NEXT_ROW_ID_XATTR_KEY = "user.extdbnextrowid";
+    private static final String EXTERNAL_DB_NEXT_ROW_ID_XATTR_KEY = "user.extdbnextrowid".concat(
+            String.valueOf(UserHandle.myUserId()));
 
     /**
      * Key name of xattr used to set session id for internal DB.
      */
-    private static final String INTERNAL_DB_SESSION_ID_XATTR_KEY = "user.intdbsessionid";
+    private static final String INTERNAL_DB_SESSION_ID_XATTR_KEY = "user.intdbsessionid".concat(
+            String.valueOf(UserHandle.myUserId()));
 
     /**
      * Key name of xattr used to set session id for external DB.
      */
-    private static final String EXTERNAL_DB_SESSION_ID_XATTR_KEY = "user.extdbsessionid";
+    private static final String EXTERNAL_DB_SESSION_ID_XATTR_KEY = "user.extdbsessionid".concat(
+            String.valueOf(UserHandle.myUserId()));
 
     /** Indicates a billion value used when next row id is not present in respective xattr. */
     private static final Long NEXT_ROW_ID_DEFAULT_BILLION_VALUE = Double.valueOf(
@@ -139,16 +144,13 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     private static final Long INVALID_ROW_ID = -1L;
 
     /**
-     * Path on which {@link DatabaseHelper#DATA_MEDIA_XATTR_DIRECTORY_PATH} is set.
-     * /storage/emulated/.. can point to /data/media/.. on ext4/f2fs on modern devices. However, for
-     * legacy devices with sdcardfs, it points to /mnt/runtime/.. which then points to
-     * /data/media/.. sdcardfs does not support xattrs, hence xattrs are set on /data/media/.. path.
-     *
-     * TODO(b/220895679): Add logic to handle external sd cards with primary volume with paths
-     * /mnt/expand/<volume>/media/<user-id>.
+     * Path used for setting next row id and database session id for each user profile. Storing here
+     * because media provider does not have required permission on path /data/media/<user-id> for
+     * work profiles.
+     * For devices with adoptable storage support, opting for adoptable storage will not delete
+     * /data/media/0 directory.
      */
-    public static final String DATA_MEDIA_XATTR_DIRECTORY_PATH = String.format(
-            "/data/media/%s", UserHandle.myUserId());
+    public static final String DATA_MEDIA_XATTR_DIRECTORY_PATH = "/data/media/0";
 
     static final String INTERNAL_DATABASE_NAME = "internal.db";
     static final String EXTERNAL_DATABASE_NAME = "external.db";
@@ -178,6 +180,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     private final String mMigrationFileName;
     long mScanStartTime;
     long mScanStopTime;
+    private boolean mEnableNextRowIdRecovery;
 
     /**
      * Unfortunately we can have multiple instances of DatabaseHelper, causing
@@ -242,10 +245,10 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             @Nullable OnSchemaChangeListener schemaListener,
             @Nullable OnFilesChangeListener filesListener,
             @NonNull OnLegacyMigrationListener migrationListener,
-            @Nullable UnaryOperator<String> idGenerator) {
+            @Nullable UnaryOperator<String> idGenerator, boolean enableNextRowIdRecovery) {
         this(context, name, getDatabaseVersion(context), earlyUpgrade, legacyProvider,
                 columnAnnotation, exportedSinceAnnotation, schemaListener, filesListener,
-                migrationListener, idGenerator);
+                migrationListener, idGenerator, enableNextRowIdRecovery);
     }
 
     public DatabaseHelper(Context context, String name, int version,
@@ -255,7 +258,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             @Nullable OnSchemaChangeListener schemaListener,
             @Nullable OnFilesChangeListener filesListener,
             @NonNull OnLegacyMigrationListener migrationListener,
-            @Nullable UnaryOperator<String> idGenerator) {
+            @Nullable UnaryOperator<String> idGenerator, boolean enableNextRowIdRecovery) {
         super(context, name, null, version);
         mContext = context;
         mName = name;
@@ -276,6 +279,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         mMigrationListener = migrationListener;
         mIdGenerator = idGenerator;
         mMigrationFileName = "." + mVolumeName;
+        this.mEnableNextRowIdRecovery = enableNextRowIdRecovery;
 
         // Configure default filters until we hear differently
         if (isInternal()) {
@@ -496,30 +500,29 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
 
     @Override
     public void onDowngrade(final SQLiteDatabase db, final int oldV, final int newV) {
-        Log.w(TAG,
-                String.format(
-                        "onDowngrade() for %s from %s to %s. Deleting database:%s in case of a "
-                                + "downgrade.",
-                        mName, oldV, newV, mName));
+        Log.w(TAG, String.format(Locale.ROOT,
+                "onDowngrade() for %s from %s to %s. Deleting database:%s in case of a "
+                        + "downgrade.", mName, oldV, newV, mName));
         deleteDatabaseFiles();
         throw new IllegalStateException(
-                String.format("Crashing MP process on database downgrade of %s.", mName));
+                String.format(Locale.ROOT, "Crashing MP process on database downgrade of %s.",
+                        mName));
     }
 
     private void deleteDatabaseFiles() {
         File dbDir = mContext.getDatabasePath(mName).getParentFile();
         File[] files = dbDir.listFiles();
         if (files == null) {
-            Log.w(TAG,
-                    String.format("No database files found on path:%s.", dbDir.getAbsolutePath()));
+            Log.w(TAG, String.format(Locale.ROOT, "No database files found on path:%s.",
+                    dbDir.getAbsolutePath()));
             return;
         }
 
         for (File file : files) {
             if (file.getName().startsWith(mName)) {
                 file.delete();
-                Log.w(TAG,
-                        String.format("Database file:%s deleted.", file.getAbsolutePath()));
+                Log.w(TAG, String.format(Locale.ROOT, "Database file:%s deleted.",
+                        file.getAbsolutePath()));
             }
         }
     }
@@ -544,17 +547,17 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             boolean isLastUsedDatabaseSession = isLastUsedDatabaseSession(db);
             Optional<Long> nextRowIdFromXattrOptional = getNextRowIdFromXattr();
             if (isLastUsedDatabaseSession && nextRowIdFromXattrOptional.isPresent()) {
-                Log.i(TAG, String.format("No database change across sequential open calls for %s.",
-                        mName));
+                Log.i(TAG, String.format(Locale.ROOT,
+                        "No database change across sequential open calls for %s.", mName));
                 mNextRowIdBackup.set(nextRowIdFromXattrOptional.get());
                 updateSessionIdInDatabaseAndExternalStorage(db);
                 return;
             }
 
-            Log.w(TAG, String.format(
+            Log.w(TAG, String.format(Locale.ROOT,
                     "%s database inconsistent: isLastUsedDatabaseSession:%b, "
-                            + "nextRowIdOptionalPresent:%b",
-                    mName, isLastUsedDatabaseSession, nextRowIdFromXattrOptional.isPresent()));
+                            + "nextRowIdOptionalPresent:%b", mName, isLastUsedDatabaseSession,
+                    nextRowIdFromXattrOptional.isPresent()));
             // TODO(b/222313219): Add an assert to ensure that next row id xattr is always
             // present when DB session id matches across sequential open calls.
             updateNextRowIdInDatabaseAndExternalStorage(db);
@@ -582,8 +585,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         boolean setOnExternalStorage = setXattr(DATA_MEDIA_XATTR_DIRECTORY_PATH,
                 getSessionIdXattrKeyForDatabase(), uuid);
         if (setOnDatabase && setOnExternalStorage) {
-            Log.i(TAG, String.format("SessionId set to %s on paths %s and %s.", uuid, db.getPath(),
-                    DATA_MEDIA_XATTR_DIRECTORY_PATH));
+            Log.i(TAG, String.format(Locale.ROOT, "SessionId set to %s on paths %s and %s.", uuid,
+                    db.getPath(), DATA_MEDIA_XATTR_DIRECTORY_PATH));
         }
     }
 
@@ -1806,7 +1809,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     }
 
     private void updateUserId(SQLiteDatabase db) {
-        db.execSQL(String.format("ALTER TABLE files ADD COLUMN _user_id INTEGER DEFAULT %d;",
+        db.execSQL(String.format(Locale.ROOT,
+                "ALTER TABLE files ADD COLUMN _user_id INTEGER DEFAULT %d;",
                 UserHandle.myUserId()));
     }
 
@@ -2268,10 +2272,10 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
 
         backupNextRowId(nextRowId);
         // Insert and delete a row to update sqlite_sequence counter
-        db.execSQL(String.format("INSERT INTO files(_ID) VALUES (%d)", nextRowId));
-        db.execSQL(String.format("DELETE FROM files WHERE _ID=%d", nextRowId));
-        Log.i(TAG, String.format("Updated sqlite counter of Files table of %s to %d.", mName,
-                nextRowId));
+        db.execSQL(String.format(Locale.ROOT, "INSERT INTO files(_ID) VALUES (%d)", nextRowId));
+        db.execSQL(String.format(Locale.ROOT, "DELETE FROM files WHERE _ID=%d", nextRowId));
+        Log.i(TAG, String.format(Locale.ROOT, "Updated sqlite counter of Files table of %s to %d.",
+                mName, nextRowId));
     }
 
     /**
@@ -2285,8 +2289,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 String.valueOf(backupId));
         if (setOnExternalStorage) {
             mNextRowIdBackup.set(backupId);
-            Log.i(TAG, String.format("Backed up next row id as:%d on path:%s for %s.", backupId,
-                    DATA_MEDIA_XATTR_DIRECTORY_PATH, mName));
+            Log.i(TAG, String.format(Locale.ROOT, "Backed up next row id as:%d on path:%s for %s.",
+                    backupId, DATA_MEDIA_XATTR_DIRECTORY_PATH, mName));
         }
     }
 
@@ -2296,8 +2300,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                     Os.getxattr(DATA_MEDIA_XATTR_DIRECTORY_PATH,
                             getNextRowIdXattrKeyForDatabase()))));
         } catch (Exception e) {
-            Log.e(TAG, String.format("Xattr:%s not found on external storage.",
-                    getNextRowIdXattrKeyForDatabase()));
+            Log.e(TAG, String.format(Locale.ROOT, "Xattr:%s not found on external storage.",
+                    getNextRowIdXattrKeyForDatabase()), e);
             return Optional.empty();
         }
     }
@@ -2309,7 +2313,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             return EXTERNAL_DB_NEXT_ROW_ID_XATTR_KEY;
         }
         throw new RuntimeException(
-                String.format("Next row id xattr key not defined for database:%s.", mName));
+                String.format(Locale.ROOT, "Next row id xattr key not defined for database:%s.",
+                        mName));
     }
 
     protected String getSessionIdXattrKeyForDatabase() {
@@ -2319,7 +2324,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             return EXTERNAL_DB_SESSION_ID_XATTR_KEY;
         }
         throw new RuntimeException(
-                String.format("Session id xattr key not defined for database:%s.", mName));
+                String.format(Locale.ROOT, "Session id xattr key not defined for database:%s.",
+                        mName));
     }
 
     protected static boolean setXattr(String path, String key, String value) {
@@ -2331,9 +2337,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             Log.d(TAG, String.format("xattr set to %s for key:%s on path: %s.", value, key, path));
             return true;
         } catch (Exception e) {
-            Log.e(TAG,
-                    String.format("Failed to set xattr:%s to %s for path: %s.", key, value, path),
-                    e);
+            Log.e(TAG, String.format(Locale.ROOT, "Failed to set xattr:%s to %s for path: %s.", key,
+                    value, path), e);
             return false;
         }
     }
@@ -2342,9 +2347,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         try {
             return Optional.of(Arrays.toString(Os.getxattr(path, key)));
         } catch (Exception e) {
-            Log.w(TAG,
-                    String.format("Exception encountered while reading xattr:%s from path:%s.", key,
-                            path));
+            Log.w(TAG, String.format(Locale.ROOT,
+                    "Exception encountered while reading xattr:%s from path:%s.", key, path));
             return Optional.empty();
         }
     }
@@ -2358,6 +2362,10 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     }
 
     boolean isNextRowIdBackupEnabled() {
+        if (!mEnableNextRowIdRecovery) {
+            return false;
+        }
+
         if (mVersion < VERSION_R) {
             // Do not back up next row id if DB version is less than R. This is unlikely to hit
             // as we will backport row id backup changes till Android R.
@@ -2369,6 +2377,13 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             // Skip id reuse fix for internal db as it can lead to ids starting from a billion
             // and can cause aberrant behaviour in Ringtones Manager. Reference: b/229153534.
             Log.v(TAG, "Skipping next row id backup for internal database.");
+            return false;
+        }
+
+        if (!(new File(DATA_MEDIA_XATTR_DIRECTORY_PATH)).exists()) {
+            Log.w(TAG, String.format(Locale.ROOT,
+                    "Skipping row id recovery as path:%s does not exist.",
+                    DATA_MEDIA_XATTR_DIRECTORY_PATH));
             return false;
         }
 
