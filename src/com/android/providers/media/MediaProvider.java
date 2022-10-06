@@ -346,6 +346,7 @@ public class MediaProvider extends ContentProvider {
     private static final String DIRECTORY_THUMBNAILS = ".thumbnails";
 
     private static final String TAKE_OVER_GET_CONTENT = "take_over_get_content";
+    private static final String FLAG_STABLISE_VOLUME_INTERNAL = "stablise_volume_internal";
 
     /**
      * Hard-coded filename where the current value of
@@ -423,6 +424,9 @@ public class MediaProvider extends ContentProvider {
     }
 
     private static final int sUserId = UserHandle.myUserId();
+
+    private static final String sRecoveryDirectoryPath =
+            "/storage/emulated/" + UserHandle.myUserId() + "/.transforms/recovery";
 
     /**
      * Please use {@link getDownloadsProviderAuthority()} instead of using this directly.
@@ -760,6 +764,8 @@ public class MediaProvider extends ContentProvider {
                     insertedRow.getId(), insertedRow.getMediaType(), insertedRow.isDownload());
             updateNextRowIdXattr(helper, insertedRow.getId());
             helper.postBackground(() -> {
+                backupVolumeDbData(helper, insertedRow.getVolumeName(), insertedRow.getPath(),
+                        insertedRow);
                 if (helper.isExternal() && !isFuseThread()) {
                     // Update the quota type on the filesystem
                     Uri fileUri = MediaStore.Files.getContentUri(insertedRow.getVolumeName(),
@@ -840,6 +846,7 @@ public class MediaProvider extends ContentProvider {
                     Trace.endSection();
                 }
 
+                deleteFromDbBackup(deletedRow);
                 switch (deletedRow.getMediaType()) {
                     case FileColumns.MEDIA_TYPE_PLAYLIST:
                     case FileColumns.MEDIA_TYPE_AUDIO:
@@ -863,6 +870,50 @@ public class MediaProvider extends ContentProvider {
             });
         }
     };
+
+    /**
+     * Backs up DB data in external storage to recover in case of DB rollback.
+     */
+    private void backupVolumeDbData(DatabaseHelper databaseHelper, String volumeName,
+            String insertedFilePath, FileRow insertedRow) {
+        if (!isStableUrisEnabled(volumeName)) {
+            return;
+        }
+
+        if (databaseHelper.isDatabaseRecovering()) {
+            return;
+        }
+
+        // For all internal file paths, redirect to external primary fuse daemon.
+        String fuseDaemonFilePath = insertedFilePath.startsWith("/storage") ? insertedFilePath
+                : "/storage/emulated/" + UserHandle.myUserId();
+        try {
+            // TODO(b/239414235): Replace value with container class.
+            getFuseDaemonForFile(new File(fuseDaemonFilePath)).backupVolumeDbData(insertedFilePath,
+                    insertedRow.toString());
+        } catch (IOException e) {
+            Log.w(TAG, "Failure in backing up data to external storage", e);
+        }
+    }
+
+    /**
+     * Deletes backed up data(needed for recovery) from external storage.
+     */
+    private void deleteFromDbBackup(FileRow deletedRow) {
+        if (!isStableUrisEnabled(deletedRow.getVolumeName())) {
+            return;
+        }
+
+        String deletedFilePath = deletedRow.getPath();
+        // For all internal file paths, redirect to external primary fuse daemon.
+        String fuseDaemonFilePath = deletedFilePath.startsWith("/storage") ? deletedFilePath
+                : "/storage/emulated/" + UserHandle.myUserId();
+        try {
+            getFuseDaemonForFile(new File(fuseDaemonFilePath)).deleteDbBackup(deletedFilePath);
+        } catch (IOException e) {
+            Log.w(TAG, "Failure in deleting backup data for key: " + deletedFilePath, e);
+        }
+    }
 
     protected void updateNextRowIdXattr(DatabaseHelper helper, long id) {
         if (!helper.isNextRowIdBackupEnabled()) {
@@ -1206,6 +1257,7 @@ public class MediaProvider extends ContentProvider {
         }
 
         checkDeviceConfigAndUpdateGetContentAlias();
+        addOnPropertiesChangedListener(properties -> checkDeviceConfigAndUpdateGetContentAlias());
 
         PulledMetrics.initialize(context);
         return true;
@@ -2543,14 +2595,20 @@ public class MediaProvider extends ContentProvider {
 
             // Get relative path for the contents of given directory.
             String relativePath = extractRelativePathWithDisplayName(path);
-
             if (relativePath == null) {
                 // Path is /storage/emulated/, if relativePath is null, MediaProvider doesn't
                 // have any details about the given directory. Use lower file system to obtain
                 // files and directories in the given directory.
                 return new String[] {"/"};
             }
-
+            // Getting UserId from the directory path, as clone user shares the MediaProvider
+            // of user 0.
+            int userIdFromPath = FileUtils.extractUserId(path);
+            // In some cases, like querying public volumes, userId is not available in path. We
+            // take userId from the user running MediaProvider process (sUserId).
+            if (userIdFromPath == -1) {
+                userIdFromPath = sUserId;
+            }
             // For all other paths, get file names from media provider database.
             // Return media and non-media files visible to the calling package.
             ArrayList<String> fileNamesList = new ArrayList<>();
@@ -2560,8 +2618,9 @@ public class MediaProvider extends ContentProvider {
 
             Bundle queryArgs = new Bundle();
             queryArgs.putString(QUERY_ARG_SQL_SELECTION, MediaColumns.RELATIVE_PATH +
-                    " =? and mime_type not like 'null'");
-            queryArgs.putStringArray(QUERY_ARG_SQL_SELECTION_ARGS, new String[] {relativePath});
+                    " =? and " + FileColumns._USER_ID + " =? and mime_type not like 'null'");
+            queryArgs.putStringArray(QUERY_ARG_SQL_SELECTION_ARGS, new String[] {relativePath,
+                    String.valueOf(userIdFromPath)});
             // Get database entries for files from MediaProvider database with
             // MediaColumns.RELATIVE_PATH as the given path.
             try (final Cursor cursor = query(FileUtils.getContentUriForPath(path), projection,
@@ -3403,6 +3462,10 @@ public class MediaProvider extends ContentProvider {
         final DatabaseHelper helper = getDatabaseForUri(uri);
         final SQLiteQueryBuilder qb = getQueryBuilder(TYPE_QUERY, table, uri, queryArgs,
                 honoredArgs::add);
+        // Allowing hidden column _user_id for this query to support Cloned Profile use case.
+        if (table == FILES) {
+            qb.allowColumn(FileColumns._USER_ID);
+        }
 
         if (targetSdkVersion < Build.VERSION_CODES.R) {
             // Some apps are abusing "ORDER BY" clauses to inject "LIMIT"
@@ -6418,6 +6481,17 @@ public class MediaProvider extends ContentProvider {
                 } finally {
                     restoreLocalCallingIdentity(token);
                 }
+            case MediaStore.GET_CLOUD_PROVIDER_CALL: {
+                // TODO(b/245746037): replace UID check with Permission(MANAGE_CLOUD_MEDIA_PROVIDER)
+                if (Binder.getCallingUid() != MY_UID) {
+                    throw new SecurityException("Get cloud provider not allowed. Calling UID:"
+                            + Binder.getCallingUid() + ", MP UID:" + MY_UID);
+                }
+                final Bundle bundle = new Bundle();
+                bundle.putString(MediaStore.GET_CLOUD_PROVIDER_RESULT,
+                        mPickerSyncController.getCloudProvider());
+                return bundle;
+            }
             case MediaStore.SET_CLOUD_PROVIDER_CALL: {
                 // TODO(b/190713331): Remove after initial development
                 final String cloudProvider = extras.getString(MediaStore.EXTRA_CLOUD_PROVIDER);
@@ -9871,6 +9945,8 @@ public class MediaProvider extends ContentProvider {
             return;
         }
 
+        // TODO(b/246590468): Follow best naming practices for namespaces of device config flags
+        // that make changes to this package independent of reboot
         DeviceConfig.addOnPropertiesChangedListener(DeviceConfig.NAMESPACE_STORAGE_NATIVE_BOOT,
                 BackgroundThread.getExecutor(), listener);
     }
@@ -10267,6 +10343,7 @@ public class MediaProvider extends ContentProvider {
             mAttachedVolumes.add(volume);
         }
 
+        setupVolumeDbBackupAndRecovery(volume);
         final ContentResolver resolver = getContext().getContentResolver();
         final Uri uri = getBaseContentUri(volumeName);
         // TODO(b/182396009) we probably also want to notify clone profile (and vice versa)
@@ -10291,6 +10368,40 @@ public class MediaProvider extends ContentProvider {
             });
         }
         return uri;
+    }
+
+    private void setupVolumeDbBackupAndRecovery(MediaVolume volume) {
+        if (MediaStore.VOLUME_INTERNAL.equalsIgnoreCase(volume.getName())) {
+            // Leveldb setup for internal volume is done during leveldb setup for primary external.
+            return;
+        }
+        if (!getBooleanDeviceConfig(FLAG_STABLISE_VOLUME_INTERNAL, /* defaultValue */false)) {
+            return;
+        }
+
+        try {
+            if (!new File(sRecoveryDirectoryPath).exists()) {
+                new File(sRecoveryDirectoryPath).mkdirs();
+            }
+            getFuseDaemonForFile(volume.getPath()).setupVolumeDbBackup();
+        } catch (IOException e) {
+            Log.w(TAG, "Failure in setting up backup and recovery for volume: " + volume.getName(),
+                    e);
+        }
+    }
+
+    /**
+     * Returns true if migration and recovery code flow for stable uris is enabled for given volume.
+     */
+    private boolean isStableUrisEnabled(String volumeName) {
+
+        switch (volumeName) {
+            case MediaStore.VOLUME_INTERNAL:
+                return getBooleanDeviceConfig(FLAG_STABLISE_VOLUME_INTERNAL, /* defaultValue= */
+                        false);
+            default:
+                return false;
+        }
     }
 
     private void detachVolume(Uri uri) {
