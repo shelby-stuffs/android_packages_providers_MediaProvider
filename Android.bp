@@ -27,12 +27,14 @@ android_app {
         "androidx.exifinterface_exifinterface",
         "exoplayer-mediaprovider-ui",
         "modules-utils-shell-command-handler",
+        "SettingsLibProfileSelector",
     ],
 
     libs: [
         "unsupportedappusage",
         "app-compat-annotations",
         "framework-annotations-lib",
+        "framework-configinfrastructure",
         "framework-mediaprovider.impl",
         "framework-media.stubs.module_lib",
         "framework-statsd",
