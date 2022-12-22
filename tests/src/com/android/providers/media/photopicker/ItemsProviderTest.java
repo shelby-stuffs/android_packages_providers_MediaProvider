@@ -42,6 +42,8 @@ import android.net.Uri;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.util.Log;
+import android.util.Pair;
 
 import androidx.test.InstrumentationRegistry;
 
@@ -50,13 +52,18 @@ import com.android.providers.media.photopicker.data.model.Category;
 import com.android.providers.media.photopicker.data.model.UserId;
 import com.android.providers.media.scan.MediaScannerTest.IsolatedContext;
 
+import com.google.common.io.ByteStreams;
+
 import org.junit.Before;
 import org.junit.Test;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 public class ItemsProviderTest {
@@ -76,19 +83,20 @@ public class ItemsProviderTest {
     private ItemsProvider mItemsProvider;
 
     @Before
-    public void setUp() {
+    public void setUp() throws Exception {
         final UiAutomation uiAutomation = InstrumentationRegistry.getInstrumentation()
                 .getUiAutomation();
 
         uiAutomation.adoptShellPermissionIdentity(Manifest.permission.LOG_COMPAT_CHANGE,
                         Manifest.permission.READ_COMPAT_CHANGE_CONFIG,
                         Manifest.permission.READ_DEVICE_CONFIG,
-                        Manifest.permission.INTERACT_ACROSS_USERS);
+                        Manifest.permission.INTERACT_ACROSS_USERS,
+                        Manifest.permission.MANAGE_EXTERNAL_STORAGE);
 
         // Remove sync delay to avoid flaky tests
         final String setSyncDelayCommand =
                 "device_config put storage pickerdb.default_sync_delay_ms 0";
-        uiAutomation.executeShellCommand(setSyncDelayCommand);
+        executeShellCommand(setSyncDelayCommand);
 
         final Context context = InstrumentationRegistry.getTargetContext();
         final Context isolatedContext
@@ -196,13 +204,27 @@ public class ItemsProviderTest {
         final File screenshotsDirInDownloadsDir = getScreenshotsDirFromDownloadsDir();
         File imageFileInScreenshotDirInDownloads =
                 assertCreateNewImage(screenshotsDirInDownloadsDir);
+
+        // Add a top level /Screenshots directory and add a test image inside of it.
+        createTestScreenshotImages();
+
+        // This file should not be included since it's not a valid screenshot directory, even though
+        // it looks like one.
+        final File myAlbumScreenshotsDir =
+                new File(getPicturesDir(), "MyAlbum" + Environment.DIRECTORY_SCREENSHOTS);
+        final File myAlbumScreenshotsImg = assertCreateNewImage(myAlbumScreenshotsDir);
+
         try {
-            assertGetCategoriesMatchMultiple(ALBUM_ID_SCREENSHOTS,
-                    ALBUM_ID_DOWNLOADS, /* numberOfItemsInScreenshots */ 2,
-                                             /* numberOfItemsInDownloads */ 1);
+            assertGetCategoriesMatchMultiple(Arrays.asList(
+                    Pair.create(ALBUM_ID_SCREENSHOTS, 3),
+                    Pair.create(ALBUM_ID_DOWNLOADS, 1)
+            ));
         } finally {
             imageFile.delete();
             imageFileInScreenshotDirInDownloads.delete();
+            myAlbumScreenshotsImg.delete();
+            myAlbumScreenshotsDir.delete();
+            deleteTopLevelScreenshotDir();
         }
     }
 
@@ -317,9 +339,10 @@ public class ItemsProviderTest {
         final File cameraDir = getCameraDir();
         File videoFile = assertCreateNewVideo(cameraDir);
         try {
-            assertGetCategoriesMatchMultiple(ALBUM_ID_CAMERA, ALBUM_ID_VIDEOS,
-                    /* numberOfItemsInCamera */ 1,
-                    /* numberOfItemsInVideos */ 1);
+            assertGetCategoriesMatchMultiple(Arrays.asList(
+                    Pair.create(ALBUM_ID_VIDEOS, 1),
+                    Pair.create(ALBUM_ID_CAMERA, 1)
+            ));
         } finally {
             videoFile.delete();
         }
@@ -340,10 +363,10 @@ public class ItemsProviderTest {
         File imageFile = assertCreateNewImage(screenshotsDir);
         setIsFavorite(imageFile);
         try {
-            assertGetCategoriesMatchMultiple(ALBUM_ID_SCREENSHOTS,
-                    ALBUM_ID_FAVORITES,
-                    /* numberOfItemsInScreenshots */ 1,
-                    /* numberOfItemsInFavorites */ 1);
+            assertGetCategoriesMatchMultiple(Arrays.asList(
+                    Pair.create(ALBUM_ID_FAVORITES, 1),
+                    Pair.create(ALBUM_ID_SCREENSHOTS, 1)
+            ));
         } finally {
             imageFile.delete();
         }
@@ -364,10 +387,10 @@ public class ItemsProviderTest {
         File imageFile = assertCreateNewImage(downloadsDir);
         setIsFavorite(imageFile);
         try {
-            assertGetCategoriesMatchMultiple(ALBUM_ID_DOWNLOADS,
-                    ALBUM_ID_FAVORITES,
-                    /* numberOfItemsInScreenshots */ 1,
-                    /* numberOfItemsInFavorites */ 1);
+            assertGetCategoriesMatchMultiple(Arrays.asList(
+                    Pair.create(ALBUM_ID_FAVORITES, 1),
+                    Pair.create(ALBUM_ID_DOWNLOADS, 1)
+            ));
         } finally {
             imageFile.delete();
         }
@@ -640,44 +663,38 @@ public class ItemsProviderTest {
     }
 
     private void assertCategoriesNoMatch(String expectedCategoryName) {
-        Cursor c = mItemsProvider.getCategories(/* mimeType */ null, /* userId */ null);
-        while (c != null && c.moveToNext()) {
-            final int nameColumnIndex = c.getColumnIndexOrThrow(AlbumColumns.DISPLAY_NAME);
-            final String categoryName = c.getString(nameColumnIndex);
-            assertThat(categoryName).isNotEqualTo(expectedCategoryName);
+        try (Cursor c = mItemsProvider.getCategories(/* mimeType */ null, /* userId */ null)) {
+            while (c != null && c.moveToNext()) {
+                final int nameColumnIndex = c.getColumnIndexOrThrow(AlbumColumns.DISPLAY_NAME);
+                final String categoryName = c.getString(nameColumnIndex);
+                assertThat(categoryName).isNotEqualTo(expectedCategoryName);
+            }
         }
     }
 
-    private void assertGetCategoriesMatchMultiple(String category1, String category2,
-            int numberOfItems1, int numberOfItems2) {
-        Cursor c = mItemsProvider.getCategories(/* mimeType */ null, /* userId */ null);
-        assertThat(c).isNotNull();
-        assertThat(c.getCount()).isEqualTo(2);
 
-        // Assert that category1 and category2 is returned and has numberOfItems1 and
-        // numberOfItems2 items in them respectively.
-        boolean isCategory1Returned = false;
-        boolean isCategory2Returned = false;
-        while (c.moveToNext()) {
-            final int nameColumnIndex = c.getColumnIndexOrThrow(AlbumColumns.DISPLAY_NAME);
-            final int numOfItemsColumnIndex = c.getColumnIndexOrThrow(
-                    AlbumColumns.MEDIA_COUNT);
-
-            final String categoryName = c.getString(nameColumnIndex);
-            final int numOfItems = c.getInt(numOfItemsColumnIndex);
-
-
-            if (categoryName.equals(category1)) {
-                isCategory1Returned = true;
-                assertThat(numOfItems).isEqualTo(numberOfItems1);
-            } else if (categoryName.equals(category2)) {
-                isCategory2Returned = true;
-                assertThat(numOfItems).isEqualTo(numberOfItems2);
-            }
+    private void assertGetCategoriesMatchMultiple(List<Pair<String, Integer>> categories) {
+        try (Cursor c = mItemsProvider.getCategories(/* mimeType */ null, /* userId */ null)) {
+            assertGetCategoriesMatchMultiple(c, categories);
         }
+    }
 
-        assertThat(isCategory1Returned).isTrue();
-        assertThat(isCategory2Returned).isTrue();
+    private void assertGetCategoriesMatchMultiple(Cursor c,
+            List<Pair<String, Integer>> categories) {
+        assertThat(c).isNotNull();
+        assertWithMessage("Expected number of albums")
+                .that(c.getCount()).isEqualTo(categories.size());
+
+        final int nameColumnIndex = c.getColumnIndexOrThrow(AlbumColumns.DISPLAY_NAME);
+        final int numOfItemsColumnIndex = c.getColumnIndexOrThrow(
+                AlbumColumns.MEDIA_COUNT);
+        for (Pair<String, Integer> category : categories) {
+            c.moveToNext();
+
+            assertThat(category.first).isEqualTo(c.getString(nameColumnIndex));
+            assertWithMessage("Expected item count for " + category.first).that(
+                    c.getInt(numOfItemsColumnIndex)).isEqualTo(category.second);
+        }
     }
 
     private void setIsFavorite(File file) {
@@ -728,6 +745,37 @@ public class ItemsProviderTest {
     private void assertThatAllVideos(int count) {
         int countOfVideos = getCountOfMediaStoreVideos();
         assertThat(count).isEqualTo(countOfVideos);
+    }
+
+    private void createTestScreenshotImages() throws IOException {
+        // Top Level /Screenshots/ directory is not allowed by MediaProvider, so the directory
+        // and test files in it are created via shell commands.
+
+        final String createTopLevelScreenshotDirCommand =
+                "mkdir -p "
+                        + Environment.getExternalStorageDirectory().getPath()
+                        + "/"
+                        + Environment.DIRECTORY_SCREENSHOTS;
+        final String createTopLevelScreenshotImgCommand =
+                "touch " + getTopLevelScreenshotsDir().getPath() + "/" + IMAGE_FILE_NAME;
+        final String writeDataTopLevelScreenshotImgCommand =
+                "echo 1 > " + getTopLevelScreenshotsDir().getPath() + "/" + IMAGE_FILE_NAME;
+
+        executeShellCommand(createTopLevelScreenshotDirCommand);
+        executeShellCommand(createTopLevelScreenshotImgCommand);
+        // Writes 1 byte to the file.
+        executeShellCommand(writeDataTopLevelScreenshotImgCommand);
+
+        final File topLevelScreenshotsDirImage =
+                new File(getTopLevelScreenshotsDir(), IMAGE_FILE_NAME);
+
+        // Force the mock MediaProvider to scan.
+        final Uri uri = MediaStore.scanFile(mIsolatedResolver, topLevelScreenshotsDirImage);
+        assertWithMessage("Uri obtained by scanning file " + topLevelScreenshotsDirImage)
+                .that(uri)
+                .isNotNull();
+        // Wait for picker db sync
+        MediaStore.waitForIdle(mIsolatedResolver);
     }
 
     private int getCountOfMediaStoreImages() {
@@ -823,6 +871,11 @@ public class ItemsProviderTest {
         return new File(getPicturesDir(), Environment.DIRECTORY_SCREENSHOTS);
     }
 
+    private File getTopLevelScreenshotsDir() {
+        return new File(
+                Environment.getExternalStorageDirectory(), Environment.DIRECTORY_SCREENSHOTS);
+    }
+
     private File getScreenshotsDirFromDownloadsDir() {
         return new File(getDownloadsDir(), Environment.DIRECTORY_SCREENSHOTS);
     }
@@ -848,6 +901,33 @@ public class ItemsProviderTest {
                 (new File(c.getString(
                         c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)))).delete();
             }
+        }
+    }
+
+    private void deleteTopLevelScreenshotDir() throws IOException {
+        final String removeTopLevelScreenshotDirCommand =
+                "rm -rf " + getTopLevelScreenshotsDir().getPath();
+        executeShellCommand(removeTopLevelScreenshotDirCommand);
+    }
+
+    /** Executes a shell command. */
+    private static String executeShellCommand(String command) throws IOException {
+        int attempt = 0;
+        while (attempt++ < 5) {
+            try {
+                return executeShellCommandInternal(command);
+            } catch (InterruptedIOException e) {
+                Log.v(TAG, "Trouble executing " + command + "; trying again", e);
+            }
+        }
+        throw new IOException("Failed to execute " + command);
+    }
+
+    private static String executeShellCommandInternal(String cmd) throws IOException {
+        UiAutomation uiAutomation = InstrumentationRegistry.getInstrumentation().getUiAutomation();
+        try (FileInputStream output = new FileInputStream(
+                uiAutomation.executeShellCommand(cmd).getFileDescriptor())) {
+            return new String(ByteStreams.toByteArray(output));
         }
     }
 }

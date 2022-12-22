@@ -17,11 +17,16 @@
 package com.android.providers.media.photopicker.viewmodel;
 
 import static android.content.Intent.ACTION_GET_CONTENT;
+import static android.provider.MediaStore.getCurrentCloudProvider;
+
+import static com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_COLLAPSED;
+import static com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED;
 
 import android.app.Application;
 import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
+import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.util.Log;
 
@@ -33,6 +38,8 @@ import androidx.lifecycle.MutableLiveData;
 
 import com.android.internal.logging.InstanceId;
 import com.android.internal.logging.InstanceIdSequence;
+import com.android.modules.utils.BackgroundThread;
+import com.android.providers.media.ConfigStore;
 import com.android.providers.media.photopicker.data.ItemsProvider;
 import com.android.providers.media.photopicker.data.MuteStatus;
 import com.android.providers.media.photopicker.data.Selection;
@@ -41,9 +48,9 @@ import com.android.providers.media.photopicker.data.model.Category;
 import com.android.providers.media.photopicker.data.model.Item;
 import com.android.providers.media.photopicker.data.model.UserId;
 import com.android.providers.media.photopicker.metrics.PhotoPickerUiEventLogger;
-import com.android.providers.media.photopicker.util.DateTimeUtils;
 import com.android.providers.media.photopicker.util.MimeFilterUtils;
 import com.android.providers.media.util.ForegroundThread;
+import com.android.providers.media.util.MimeUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -72,6 +79,7 @@ public class PickerViewModel extends AndroidViewModel {
 
     private ItemsProvider mItemsProvider;
     private UserIdManager mUserIdManager;
+    private boolean mIsUserSelectForApp;
 
     private InstanceId mInstanceId;
     private PhotoPickerUiEventLogger mLogger;
@@ -80,6 +88,7 @@ public class PickerViewModel extends AndroidViewModel {
     private int mBottomSheetState;
 
     private Category mCurrentCategory;
+    private ConfigStore mConfigStore;
 
     public PickerViewModel(@NonNull Application application) {
         super(application);
@@ -90,6 +99,8 @@ public class PickerViewModel extends AndroidViewModel {
         mMuteStatus = new MuteStatus();
         mInstanceId = new InstanceIdSequence(INSTANCE_ID_MAX).newInstanceId();
         mLogger = new PhotoPickerUiEventLogger();
+        mConfigStore = new ConfigStore.ConfigStoreImpl();
+        mIsUserSelectForApp = false;
     }
 
     @VisibleForTesting
@@ -125,13 +136,24 @@ public class PickerViewModel extends AndroidViewModel {
     }
 
     /**
-     * Reset to personal profile mode.
+     * @return {@code mIsUserSelectForApp} if the picker is currently being used
+     * for the {@link MediaStore#ACTION_USER_SELECT_IMAGES_FOR_APP} action.
      */
-    public void resetToPersonalProfile() {
+    public boolean isUserSelectForApp() {
+        return mIsUserSelectForApp;
+    }
+
+    /**
+     * Reset PickerViewModel.
+     * @param switchToPersonalProfile is true then set personal profile as current profile.
+     */
+    public void reset(boolean switchToPersonalProfile) {
         // 1. Clear Selected items
         mSelection.clearSelectedItems();
         // 2. Change profile to personal user
-        mUserIdManager.setPersonalAsCurrentUserProfile();
+        if (switchToPersonalProfile) {
+            mUserIdManager.setPersonalAsCurrentUserProfile();
+        }
         // 3. Update Item and Category lists
         updateItems();
         updateCategories();
@@ -158,36 +180,10 @@ public class PickerViewModel extends AndroidViewModel {
                 return items;
             }
 
-            // We only add the RECENT header on the PhotosTabFragment with CATEGORY_DEFAULT. In this
-            // case, we call this method {loadItems} with null category. When the category is not
-            // empty, we don't show the RECENT header.
-            final boolean showRecent = category.isDefault();
-
-            int recentSize = 0;
-            long currentDateTaken = 0;
-
-            if (showRecent) {
-                // add Recent date header
-                items.add(Item.createDateItem(0));
-            }
             while (cursor.moveToNext()) {
                 // TODO(b/188394433): Return userId in the cursor so that we do not need to pass it
-                // here again.
-                final Item item = Item.fromCursor(cursor, userId);
-                final long dateTaken = item.getDateTaken();
-                // the minimum count of items in recent is not reached
-                if (showRecent && recentSize < RECENT_MINIMUM_COUNT) {
-                    recentSize++;
-                    currentDateTaken = dateTaken;
-                }
-
-                // The date taken of these two images are not on the
-                // same day, add the new date header.
-                if (!DateTimeUtils.isSameDate(currentDateTaken, dateTaken)) {
-                    items.add(Item.createDateItem(dateTaken));
-                    currentDateTaken = dateTaken;
-                }
-                items.add(item);
+                //  here again.
+                items.add(Item.fromCursor(cursor, userId));
             }
         }
 
@@ -310,6 +306,16 @@ public class PickerViewModel extends AndroidViewModel {
         return mMimeTypeFilters != null && mMimeTypeFilters.length > 0;
     }
 
+    private boolean isAllImagesFilter() {
+        return mMimeTypeFilters != null && mMimeTypeFilters.length == 1
+                && MimeUtils.isAllImagesMimeType(mMimeTypeFilters[0]);
+    }
+
+    private boolean isAllVideosFilter() {
+        return mMimeTypeFilters != null && mMimeTypeFilters.length == 1
+                && MimeUtils.isAllVideosMimeType(mMimeTypeFilters[0]);
+    }
+
     /**
      * Parse values from {@code intent} and set corresponding fields
      */
@@ -319,6 +325,19 @@ public class PickerViewModel extends AndroidViewModel {
         mMimeTypeFilters = MimeFilterUtils.getMimeTypeFilters(intent);
 
         mSelection.parseSelectionValuesFromIntent(intent);
+
+        mIsUserSelectForApp =
+                intent.getAction().equals(MediaStore.ACTION_USER_SELECT_IMAGES_FOR_APP);
+
+        // Ensure that if Photopicker is being used for permissions the target app UID is present
+        // in the extras.
+        if (mIsUserSelectForApp
+                && (intent.getExtras() == null
+                        || !intent.getExtras()
+                                .containsKey(Intent.EXTRA_UID))) {
+            throw new IllegalArgumentException(
+                    "EXTRA_UID is required for" + " ACTION_USER_SELECT_IMAGES_FOR_APP");
+        }
     }
 
     /**
@@ -335,7 +354,11 @@ public class PickerViewModel extends AndroidViewModel {
         return mBottomSheetState;
     }
 
-    public void logPickerOpened(int callingUid, String callingPackage, String intentAction) {
+    /**
+     * Log picker opened metrics
+     */
+    public void logPickerOpened(@NonNull Context context, int callingUid, String callingPackage,
+            String intentAction) {
         if (getUserIdManager().isManagedUserSelected()) {
             mLogger.logPickerOpenWork(mInstanceId, callingUid, callingPackage);
         } else {
@@ -348,6 +371,54 @@ public class PickerViewModel extends AndroidViewModel {
         if (ACTION_GET_CONTENT.equals(intentAction)) {
             mLogger.logPickerOpenViaGetContent(mInstanceId, callingUid, callingPackage);
         }
+
+        if (mBottomSheetState == STATE_COLLAPSED) {
+            mLogger.logPickerOpenInHalfScreen(mInstanceId, callingUid, callingPackage);
+        } else if (mBottomSheetState == STATE_EXPANDED) {
+            mLogger.logPickerOpenInFullScreen(mInstanceId, callingUid, callingPackage);
+        }
+
+        if (mSelection != null && mSelection.canSelectMultiple()) {
+            mLogger.logPickerOpenInMultiSelect(mInstanceId, callingUid, callingPackage);
+        } else {
+            mLogger.logPickerOpenInSingleSelect(mInstanceId, callingUid, callingPackage);
+        }
+
+        if (isAllImagesFilter()) {
+            mLogger.logPickerOpenWithFilterAllImages(mInstanceId, callingUid, callingPackage);
+        } else if (isAllVideosFilter()) {
+            mLogger.logPickerOpenWithFilterAllVideos(mInstanceId, callingUid, callingPackage);
+        } else if (hasMimeTypeFilters()) {
+            mLogger.logPickerOpenWithAnyOtherFilter(mInstanceId, callingUid, callingPackage);
+        }
+
+        logPickerOpenedWithCloudProvider(context);
+    }
+
+    // TODO(b/245745412): Fix log params (uid & package name)
+    // TODO(b/245745424): Solve for active cloud provider without a logged in account
+    private void logPickerOpenedWithCloudProvider(@NonNull Context context) {
+        BackgroundThread.getExecutor().execute(() -> {
+            final String providerAuthority;
+            // TODO(b/245746037): Remove try-catch.
+            //  Under the hood MediaStore.getCurrentCloudProvider() makes an IPC call to the primary
+            //  MediaProvider process, where we currently perform a UID check (making sure that
+            //  the call both sender and receiver belong to the same UID).
+            //  This setup works for our "regular" PhotoPickerActivity (running in :PhotoPicker
+            //  process), but does not work for our test applications (installed to a different
+            //  UID), that provide a mock PhotoPickerActivity which will also run this code.
+            //  SOLUTION: replace the UID check on the receiving end (in MediaProvider) with a
+            //  check for MANAGE_CLOUD_MEDIA_PROVIDER permission.
+            try {
+                providerAuthority = getCurrentCloudProvider(context);
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Could not retrieve the current cloud provider", e);
+                return;
+            }
+
+            mLogger.logPickerOpenWithActiveCloudProvider(
+                    mInstanceId, /* cloudProviderUid */ -1, providerAuthority);
+        });
     }
 
     /**
@@ -387,5 +458,9 @@ public class PickerViewModel extends AndroidViewModel {
 
     public void setInstanceId(InstanceId parcelable) {
         mInstanceId = parcelable;
+    }
+
+    public ConfigStore getConfigStore() {
+        return mConfigStore;
     }
 }

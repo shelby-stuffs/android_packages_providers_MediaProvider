@@ -38,6 +38,7 @@ import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
+import android.os.SystemProperties;
 import android.os.UserHandle;
 import android.util.Log;
 import android.view.Menu;
@@ -82,6 +83,8 @@ public class PhotoPickerActivity extends AppCompatActivity {
     private static final float BOTTOM_SHEET_PEEK_HEIGHT_PERCENTAGE = 0.60f;
     private static final float HIDE_PROFILE_BUTTON_THRESHOLD = -0.5f;
     private static final String LOGGER_INSTANCE_ID_ARG = "loggerInstanceIdArg";
+    private static final String ENABLE_SETTINGS_SYS_PROP =
+            "debug.photopicker.enable_settings_screen";
 
     private PickerViewModel mPickerViewModel;
     private Selection mSelection;
@@ -111,7 +114,13 @@ public class PhotoPickerActivity extends AppCompatActivity {
         // This is required as GET_CONTENT with type "*/*" is also received by PhotoPicker due
         // to higher priority than DocumentsUi. "*/*" mime type filter is caught as it is a superset
         // of "image/*" and "video/*".
-        rerouteGetContentRequestIfRequired();
+        if (rerouteGetContentRequestIfRequired()) {
+            // This activity is finishing now: we should not run the setup below,
+            // BUT before we return we have to call super.onCreate() (otherwise we are we will get
+            // SuperNotCalledException: Activity did not call through to super.onCreate())
+            super.onCreate(savedInstanceState);
+            return;
+        }
 
         // We use the device default theme as the base theme. Apply the material them for the
         // material components. We use force "false" here, only values that are not already defined
@@ -134,16 +143,17 @@ public class PhotoPickerActivity extends AppCompatActivity {
         ta.recycle();
 
         mDefaultBackgroundColor = getColor(R.color.picker_background_color);
-        mPickerViewModel = createViewModel();
-        mSelection = mPickerViewModel.getSelection();
 
+        mPickerViewModel = getOrCreateViewModel();
         final Intent intent = getIntent();
         try {
             mPickerViewModel.parseValuesFromIntent(intent);
         } catch (IllegalArgumentException e) {
             Log.e(TAG, "Finish activity due to an exception while parsing extras", e);
             finishWithoutLoggingCancelledResult();
+            return;
         }
+        mSelection = mPickerViewModel.getSelection();
 
         mDragBar = findViewById(R.id.drag_bar);
         mPrivacyText = findViewById(R.id.privacy_text);
@@ -152,30 +162,34 @@ public class PhotoPickerActivity extends AppCompatActivity {
 
         mTabLayout = findViewById(R.id.tab_layout);
 
-        AccessibilityManager accessibilityManager = getSystemService(AccessibilityManager.class);
-        mIsAccessibilityEnabled = accessibilityManager.isEnabled();
-        accessibilityManager.addAccessibilityStateChangeListener(
-                enabled -> mIsAccessibilityEnabled = enabled);
+        final AccessibilityManager am = getSystemService(AccessibilityManager.class);
+        mIsAccessibilityEnabled = am.isEnabled();
+        am.addAccessibilityStateChangeListener(enabled -> mIsAccessibilityEnabled = enabled);
 
         initBottomSheetBehavior();
         restoreState(savedInstanceState);
 
-        String intentAction = intent != null ? intent.getAction() : null;
+        final String intentAction = intent != null ? intent.getAction() : null;
         // Call this after state is restored, to use the correct LOGGER_INSTANCE_ID_ARG
-        mPickerViewModel.logPickerOpened(Binder.getCallingUid(), getCallingPackage(), intentAction);
+        mPickerViewModel.logPickerOpened(getApplicationContext(), Binder.getCallingUid(),
+                getCallingPackage(), intentAction);
 
         // Save the fragment container layout so that we can adjust the padding based on preview or
         // non-preview mode.
         mFragmentContainerView = findViewById(R.id.fragment_container);
 
         mCrossProfileListeners = new CrossProfileListeners();
+
+        enableSettingsActivity();
     }
 
     @Override
     public void onDestroy() {
         super.onDestroy();
-        // This is required to unregister any broadcast receivers.
-        mCrossProfileListeners.onDestroy();
+        if (mCrossProfileListeners != null) {
+            // This is required to unregister any broadcast receivers.
+            mCrossProfileListeners.onDestroy();
+        }
     }
 
     /**
@@ -184,7 +198,7 @@ public class PhotoPickerActivity extends AppCompatActivity {
      */
     @VisibleForTesting
     @NonNull
-    protected PickerViewModel createViewModel() {
+    protected PickerViewModel getOrCreateViewModel() {
         return new ViewModelProvider(this).get(PickerViewModel.class);
     }
 
@@ -230,26 +244,60 @@ public class PhotoPickerActivity extends AppCompatActivity {
 
     @Override
     public boolean onCreateOptionsMenu(@NonNull Menu menu) {
-        if (ACTION_GET_CONTENT.equals(getIntent().getAction())) {
-            getMenuInflater().inflate(R.menu.picker_overflow_menu, menu);
-        }
-
+        getMenuInflater().inflate(R.menu.picker_overflow_menu, menu);
         return true;
     }
 
     @Override
+    public boolean onPrepareOptionsMenu(@NonNull Menu menu) {
+        super.onPrepareOptionsMenu(menu);
+        // All logic to hide/show an item in the menu must be in this method
+        final MenuItem settingsMenuItem = menu.findItem(R.id.settings);
+
+        // TODO(b/195009187): Settings menu item is hidden by default till Settings page is
+        // completely developed.
+        settingsMenuItem.setVisible(isSettingsScreenEnabled());
+
+        // Browse menu item allows users to launch DocumentsUI. This item should only be shown if
+        // PhotoPicker was opened via {@link #ACTION_GET_CONTENT}.
+        menu.findItem(R.id.browse).setVisible(isGetContentAction());
+
+        return menu.hasVisibleItems();
+    }
+
+    @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == R.id.browse) {
-            mPickerViewModel.logBrowseToDocumentsUi(Binder.getCallingUid(), getCallingPackage());
-            launchDocumentsUiAndFinishPicker();
+        switch (item.getItemId()) {
+            case R.id.browse:
+                mPickerViewModel.logBrowseToDocumentsUi(Binder.getCallingUid(),
+                        getCallingPackage());
+                launchDocumentsUiAndFinishPicker();
+                return true;
+            case R.id.settings:
+                final Intent intent = new Intent(this, PhotoPickerSettingsActivity.class);
+                startActivity(intent);
+                return true;
+            default:
+                // Continue to return the result of base class' onOptionsItemSelected(item)
         }
         return super.onOptionsItemSelected(item);
     }
 
-    private void rerouteGetContentRequestIfRequired() {
+    @Override
+    public void onResume() {
+        super.onResume();
+        // TODO(b/195009187): Conditionally reset PhotoPicker when current profile's cloud
+        // provider has changed.
+    }
+
+    /**
+     * @return {@code true} if the intent was re-routed to the DocumentsUI (and this
+     *  {@code PhotoPickerActivity} is {@link #isFinishing()} now). {@code false} - otherwise.
+     */
+    private boolean rerouteGetContentRequestIfRequired() {
         final Intent intent = getIntent();
         if (!ACTION_GET_CONTENT.equals(intent.getAction())) {
-            return;
+            return false;
         }
 
         // TODO(b/232775643): Workaround to support PhotoPicker invoked from DocumentsUi.
@@ -259,12 +307,15 @@ public class PhotoPickerActivity extends AppCompatActivity {
         // Make sure Photo Picker is opened when the intent is explicitly forwarded by documentsUi
         if (isIntentReferredByDocumentsUi(getReferrer())) {
             Log.i(TAG, "Open PhotoPicker when a forwarded ACTION_GET_CONTENT intent is received");
-            return;
+            return false;
         }
 
-        if (MimeFilterUtils.requiresUnsupportedFilters(intent)) {
-            launchDocumentsUiAndFinishPicker();
-        }
+        // Check if we can handle the specified MIME types.
+        // If we can - do not reroute and thus return false.
+        if (!MimeFilterUtils.requiresUnsupportedFilters(intent)) return false;
+
+        launchDocumentsUiAndFinishPicker();
+        return true;
     }
 
     private boolean isIntentReferredByDocumentsUi(Uri referrerAppUri) {
@@ -465,6 +516,15 @@ public class PhotoPickerActivity extends AppCompatActivity {
         mPickerViewModel.logPickerCancel(Binder.getCallingUid(), getCallingPackage());
     }
 
+    private void enableSettingsActivity() {
+        if (isSettingsScreenEnabled()) {
+            final ComponentName componentName = new ComponentName(this,
+                    PhotoPickerSettingsActivity.class);
+            getPackageManager().setComponentEnabledSetting(componentName,
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP);
+        }
+    }
+
     /**
      * Updates the common views such as Title, Toolbar, Navigation bar, status bar and bottom sheet
      * behavior
@@ -626,6 +686,32 @@ public class PhotoPickerActivity extends AppCompatActivity {
         mPrivacyText.setVisibility(shouldShowPrivacyMessage ? View.VISIBLE : View.GONE);
     }
 
+    /**
+     * Reset to Photo Picker initial launch state (Photos grid tab) in personal profile mode.
+     * @param switchToPersonalProfile is true then set personal profile as current profile.
+     */
+    private void reset(boolean switchToPersonalProfile) {
+        mPickerViewModel.reset(switchToPersonalProfile);
+        setupInitialLaunchState();
+    }
+
+    /**
+     * Returns {@code true} if settings page is enabled.
+     */
+    private boolean isSettingsScreenEnabled() {
+        List<String> allowedCloudProviders = mPickerViewModel.getConfigStore()
+                .getAllowlistedCloudProviders();
+        return !allowedCloudProviders.isEmpty()
+                && SystemProperties.getBoolean(ENABLE_SETTINGS_SYS_PROP, false);
+    }
+
+    /**
+     * Returns {@code true} if intent action is ACTION_GET_CONTENT.
+     */
+    private boolean isGetContentAction() {
+        return ACTION_GET_CONTENT.equals(getIntent().getAction());
+    }
+
     private class CrossProfileListeners {
 
         private final List<String> MANAGED_PROFILE_FILTER_ACTIONS = Lists.newArrayList(
@@ -723,15 +809,7 @@ public class PhotoPickerActivity extends AppCompatActivity {
 
             // We reset the state of the PhotoPicker as we do not want to make any
             // assumptions on the state of the PhotoPicker when it was in Work Profile mode.
-            resetToPersonalProfile();
-        }
-
-        /**
-         * Reset to Photo Picker initial launch state (Photos grid tab) in personal profile mode.
-         */
-        private void resetToPersonalProfile() {
-            mPickerViewModel.resetToPersonalProfile();
-            setupInitialLaunchState();
+            reset(/* switchToPersonalProfile */ true);
         }
     }
 }

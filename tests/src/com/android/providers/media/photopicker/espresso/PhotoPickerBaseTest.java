@@ -102,6 +102,15 @@ public class PhotoPickerBaseTest {
         sMultiSelectionIntent.putExtras(extras);
     }
 
+    private static final Intent sUserSelectImagesForAppIntent;
+    static {
+        sUserSelectImagesForAppIntent = new Intent(MediaStore.ACTION_USER_SELECT_IMAGES_FOR_APP);
+        sUserSelectImagesForAppIntent.addCategory(Intent.CATEGORY_FRAMEWORK_INSTRUMENTATION_TEST);
+        Bundle extras = new Bundle();
+        extras.putInt(Intent.EXTRA_UID, 1234);
+        sUserSelectImagesForAppIntent.putExtras(extras);
+    }
+
     private static final File IMAGE_1_FILE = new File(Environment.getExternalStorageDirectory(),
             Environment.DIRECTORY_DCIM + "/Camera"
                     + "/image_" + System.currentTimeMillis() + ".jpeg");
@@ -130,6 +139,10 @@ public class PhotoPickerBaseTest {
         return sMultiSelectionIntent;
     }
 
+    public static Intent getUserSelectImagesForAppIntent() {
+        return sUserSelectImagesForAppIntent;
+    }
+
     public static Intent getMultiSelectionIntent(int max) {
         final Intent intent = new Intent(sMultiSelectionIntent);
         Bundle extras = new Bundle();
@@ -156,7 +169,8 @@ public class PhotoPickerBaseTest {
                 .adoptShellPermissionIdentity(Manifest.permission.LOG_COMPAT_CHANGE,
                         Manifest.permission.READ_COMPAT_CHANGE_CONFIG,
                         Manifest.permission.INTERACT_ACROSS_USERS,
-                        Manifest.permission.READ_DEVICE_CONFIG);
+                        Manifest.permission.READ_DEVICE_CONFIG,
+                        Manifest.permission.MANAGE_EXTERNAL_STORAGE);
 
         sIsolatedContext = new IsolatedContext(getTargetContext(), "modern",
                 /* asFuseThread */ false);

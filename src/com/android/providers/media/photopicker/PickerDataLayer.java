@@ -17,6 +17,8 @@
 package com.android.providers.media.photopicker;
 
 import static android.provider.CloudMediaProviderContract.METHOD_GET_MEDIA_COLLECTION_INFO;
+import static android.provider.CloudMediaProviderContract.MediaCollectionInfo.ACCOUNT_CONFIGURATION_INTENT;
+import static android.provider.CloudMediaProviderContract.MediaCollectionInfo.ACCOUNT_NAME;
 
 import static com.android.providers.media.PickerUriResolver.getAlbumUri;
 import static com.android.providers.media.PickerUriResolver.getMediaCollectionInfoUri;
@@ -26,10 +28,13 @@ import android.content.Intent;
 import android.database.Cursor;
 import android.database.MergeCursor;
 import android.os.Bundle;
-import android.provider.CloudMediaProviderContract;
+import android.os.Trace;
 import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.util.Log;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.android.providers.media.photopicker.data.CloudProviderQueryExtras;
 import com.android.providers.media.photopicker.data.PickerDbFacade;
@@ -42,6 +47,7 @@ import java.util.List;
  */
 public class PickerDataLayer {
     private static final String TAG = "PickerDataLayer";
+    private static final boolean DEBUG = false;
 
     private final Context mContext;
     private final PickerDbFacade mDbFacade;
@@ -57,10 +63,24 @@ public class PickerDataLayer {
     }
 
     public Cursor fetchMedia(Bundle queryArgs) {
+        if (DEBUG) {
+            Log.d(TAG, "fetchMedia() [" + Thread.currentThread() + "] args=" + queryArgs);
+        }
+
         final CloudProviderQueryExtras queryExtras
                 = CloudProviderQueryExtras.fromMediaStoreBundle(queryArgs, mLocalProvider);
-        final String albumId = queryExtras.getAlbumId();
         final String authority = queryExtras.getAlbumAuthority();
+
+        Trace.beginSection(traceSectionName("fetchMedia", authority));
+        try {
+            return fetchMediaInternal(authority, queryExtras);
+        } finally {
+            Trace.endSection();
+        }
+    }
+
+    private Cursor fetchMediaInternal(String authority, CloudProviderQueryExtras queryExtras) {
+        final String albumId = queryExtras.getAlbumId();
         // Use media table for all media except albums. Merged categories like,
         // favorites and video are tagged in the media table and are not a part of
         // album_media.
@@ -69,6 +89,7 @@ public class PickerDataLayer {
             mSyncController.syncAllMedia();
 
             if (TextUtils.isEmpty(albumId)) {
+                // TODO(b/257887919): Build proper UI and remove this.
                 // Notify that the picker is launched in case there's any pending UI notification
                 mSyncController.notifyPickerLaunch();
             }
@@ -99,6 +120,19 @@ public class PickerDataLayer {
     }
 
     public Cursor fetchAlbums(Bundle queryArgs) {
+        if (DEBUG) {
+            Log.d(TAG, "fetchAlbums() [" + Thread.currentThread() + "] args=" + queryArgs);
+        }
+
+        Trace.beginSection(traceSectionName("fetchAlbums"));
+        try {
+            return fetchAlbumsInternal(queryArgs);
+        } finally {
+            Trace.endSection();
+        }
+    }
+
+    private Cursor fetchAlbumsInternal(Bundle queryArgs) {
         // Refresh the 'media' table so that 'merged' albums (Favorites and Videos) are up to date
         mSyncController.syncAllMedia();
 
@@ -136,37 +170,58 @@ public class PickerDataLayer {
         return mergeCursor;
     }
 
+    @Nullable
     public AccountInfo fetchCloudAccountInfo() {
+        if (DEBUG) {
+            Log.d(TAG, "fetchCloudAccountInfo() [" + Thread.currentThread() + "]");
+        }
+
         final String cloudProvider = mDbFacade.getCloudProvider();
         if (cloudProvider == null) {
             return null;
         }
 
+        Trace.beginSection(traceSectionName("fetchCloudAccountInfo"));
         try {
-            final Bundle accountBundle = mContext.getContentResolver().call(
-                    getMediaCollectionInfoUri(cloudProvider), METHOD_GET_MEDIA_COLLECTION_INFO,
-                    /* arg */ null, /* extras */ null);
-            final String accountName = accountBundle.getString(
-                    CloudMediaProviderContract.MediaCollectionInfo.ACCOUNT_NAME);
-            final Intent configIntent = (Intent) accountBundle.getParcelable(
-                    CloudMediaProviderContract.MediaCollectionInfo.ACCOUNT_CONFIGURATION_INTENT);
-
-            if (accountName == null) {
-                return null;
-            }
-
-            return new AccountInfo(accountName, configIntent);
+            return fetchCloudAccountInfoInternal(cloudProvider);
         } catch (Exception e) {
             Log.w(TAG, "Failed to fetch account info from cloud provider: " + cloudProvider, e);
             return null;
+        } finally {
+            Trace.endSection();
         }
     }
 
-    private Cursor queryProviderAlbums(String authority, Bundle queryArgs) {
+    @Nullable
+    private AccountInfo fetchCloudAccountInfoInternal(@NonNull String cloudProvider) {
+        final Bundle accountBundle = mContext.getContentResolver()
+                .call(getMediaCollectionInfoUri(cloudProvider), METHOD_GET_MEDIA_COLLECTION_INFO,
+                        /* arg */ null, /* extras */ null);
+
+        final String accountName = accountBundle.getString(ACCOUNT_NAME);
+        if (accountName == null) {
+            return null;
+        }
+        final Intent configIntent = accountBundle.getParcelable(ACCOUNT_CONFIGURATION_INTENT);
+
+        return new AccountInfo(accountName, configIntent);
+    }
+
+    private Cursor queryProviderAlbums(@Nullable String authority, Bundle queryArgs) {
         if (authority == null) {
             // Can happen if there is no cloud provider
             return null;
         }
+
+        Trace.beginSection(traceSectionName("queryProviderAlbums", authority));
+        try {
+            return queryProviderAlbumsInternal(authority, queryArgs);
+        } finally {
+            Trace.endSection();
+        }
+    }
+
+    private Cursor queryProviderAlbumsInternal(@NonNull String authority, Bundle queryArgs) {
         try {
             return mContext.getContentResolver().query(getAlbumUri(authority),
                     /* projection */ null, queryArgs, /* cancellationSignal */ null);
@@ -178,6 +233,19 @@ public class PickerDataLayer {
 
     private boolean isLocal(String authority) {
         return mLocalProvider.equals(authority);
+    }
+
+    private String traceSectionName(@NonNull String method) {
+        return traceSectionName(method, null);
+    }
+
+    private String traceSectionName(@NonNull String method, @Nullable String authority) {
+        final StringBuilder sb = new StringBuilder("PDL.")
+                .append(method);
+        if (authority != null) {
+            sb.append('[').append(isLocal(authority) ? "local" : "cloud").append(']');
+        }
+        return sb.toString();
     }
 
     public static class AccountInfo {
