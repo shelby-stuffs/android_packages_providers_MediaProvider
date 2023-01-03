@@ -48,6 +48,11 @@ import static android.provider.MediaStore.READ_BACKED_UP_FILE_PATHS;
 import static android.provider.MediaStore.getVolumeName;
 import static android.system.OsConstants.F_GETFL;
 
+import static com.android.providers.media.AccessChecker.getWhereForConstrainedAccess;
+import static com.android.providers.media.AccessChecker.getWhereForOwnerPackageMatch;
+import static com.android.providers.media.AccessChecker.getWhereForUserSelectedAccess;
+import static com.android.providers.media.AccessChecker.hasAccessToCollection;
+import static com.android.providers.media.AccessChecker.hasUserSelectedAccess;
 import static com.android.providers.media.DatabaseHelper.EXTERNAL_DATABASE_NAME;
 import static com.android.providers.media.DatabaseHelper.INTERNAL_DATABASE_NAME;
 import static com.android.providers.media.DatabaseHelper.LEVEL_DB_READ_LIMIT;
@@ -63,13 +68,7 @@ import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_RED
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_SELF;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_SHELL;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_SYSTEM_GALLERY;
-import static com.android.providers.media.LocalCallingIdentity.PERMISSION_READ_AUDIO;
-import static com.android.providers.media.LocalCallingIdentity.PERMISSION_READ_IMAGES;
-import static com.android.providers.media.LocalCallingIdentity.PERMISSION_READ_VIDEO;
-import static com.android.providers.media.LocalCallingIdentity.PERMISSION_WRITE_AUDIO;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_WRITE_EXTERNAL_STORAGE;
-import static com.android.providers.media.LocalCallingIdentity.PERMISSION_WRITE_IMAGES;
-import static com.android.providers.media.LocalCallingIdentity.PERMISSION_WRITE_VIDEO;
 import static com.android.providers.media.PickerUriResolver.getMediaUri;
 import static com.android.providers.media.scan.MediaScanner.REASON_DEMAND;
 import static com.android.providers.media.scan.MediaScanner.REASON_IDLE;
@@ -100,6 +99,7 @@ import static com.android.providers.media.util.FileUtils.toFuseFile;
 import static com.android.providers.media.util.Logging.LOGV;
 import static com.android.providers.media.util.Logging.TAG;
 import static com.android.providers.media.util.PermissionUtils.checkPermissionSelf;
+import static com.android.providers.media.util.StringUtils.componentStateToString;
 import static com.android.providers.media.util.SyntheticPathUtils.REDACTED_URI_ID_PREFIX;
 import static com.android.providers.media.util.SyntheticPathUtils.REDACTED_URI_ID_SIZE;
 import static com.android.providers.media.util.SyntheticPathUtils.createSparseFile;
@@ -118,7 +118,6 @@ import android.app.DownloadManager;
 import android.app.PendingIntent;
 import android.app.RecoverableSecurityException;
 import android.app.RemoteAction;
-import android.app.admin.DevicePolicyManager;
 import android.app.compat.CompatChanges;
 import android.compat.annotation.ChangeId;
 import android.compat.annotation.EnabledAfter;
@@ -362,7 +361,7 @@ public class MediaProvider extends ContentProvider {
      * But for example, we do an exception for System Gallery apps and allow them full access to:
      * DCIM, Pictures, Movies.
      */
-    private static final String INCLUDED_DEFAULT_DIRECTORIES =
+    static final String INCLUDED_DEFAULT_DIRECTORIES =
             "android:included-default-directories";
 
     /**
@@ -1228,20 +1227,21 @@ public class MediaProvider extends ContentProvider {
         mThumbSize = new Size(thumbSize, thumbSize);
 
         mMediaScanner = new ModernMediaScanner(context);
-
+        mProjectionHelper = new ProjectionHelper(Column.class, ExportedSince.class);
         mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME, false, false,
-                Column.class, ExportedSince.class, Metrics::logSchemaChange, mFilesListener,
+                mProjectionHelper, Metrics::logSchemaChange, mFilesListener,
                 MIGRATION_LISTENER, mIdGenerator, true);
         mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME, false, false,
-                Column.class, ExportedSince.class, Metrics::logSchemaChange, mFilesListener,
+                mProjectionHelper, Metrics::logSchemaChange, mFilesListener,
                 MIGRATION_LISTENER, mIdGenerator, true);
         mExternalDbFacade = new ExternalDbFacade(getContext(), mExternalDatabase, mVolumeCache);
         mPickerDbFacade = new PickerDbFacade(context);
+        mMediaGrants = new MediaGrants(mExternalDatabase);
 
         mConfigStore = createConfigStore();
         mPickerSyncController = new PickerSyncController(context, mPickerDbFacade, mConfigStore);
         mPickerDataLayer = new PickerDataLayer(context, mPickerDbFacade, mPickerSyncController);
-        mPickerUriResolver = new PickerUriResolver(context, mPickerDbFacade);
+        mPickerUriResolver = new PickerUriResolver(context, mPickerDbFacade, mProjectionHelper);
 
         if (SdkLevel.isAtLeastS()) {
             mTranscodeHelper = new TranscodeHelperImpl(context, this, mConfigStore);
@@ -1361,8 +1361,9 @@ public class MediaProvider extends ContentProvider {
                 ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED
                 : PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
 
-        Log.i(TAG, "Change component enabled state to " + expectedState
-                + " for PhotoPickerGetContentActivity. ");
+        Log.i(TAG, "Changed PhotoPickerGetContentActivity component state to "
+                + componentStateToString(expectedState));
+
         getContext().getPackageManager().setComponentEnabledSetting(componentName, expectedState,
                 PackageManager.DONT_KILL_APP);
 
@@ -1893,6 +1894,8 @@ public class MediaProvider extends ContentProvider {
         deleteAndroidMediaEntries(db, packageName, userId);
         // Orphan rest of entries.
         orphanEntries(db, packageName, userId);
+        // TODO(b/260685885): Add e2e tests to ensure these are cleared when a package is removed.
+        mMediaGrants.removeAllMediaGrantsForPackage(packageName);
     }
 
     private void deleteAndroidMediaEntries(SQLiteDatabase db, String packageName, int userId) {
@@ -2584,11 +2587,11 @@ public class MediaProvider extends ContentProvider {
                     + FileColumns._MODIFIER_CR_PENDING_METADATA;
             final String notPending = String.format("(%s=0 AND NOT %s)", column,
                     pendingForMetadata);
-            final String matchSharedPackagesClause = FileColumns.OWNER_PACKAGE_NAME + " IN "
-                    + getSharedPackages();
+
             // Include owned pending files from Fuse
             final String pendingFromFuse = String.format("(%s=1 AND %s AND %s)", column,
-                    MATCH_PENDING_FROM_FUSE, matchSharedPackagesClause);
+                    MATCH_PENDING_FROM_FUSE, getWhereForOwnerPackageMatch(mCallingIdentity.get()));
+
             return "(" + notPending + " OR " + pendingFromFuse + ")";
         }
         return column + "=0";
@@ -2606,86 +2609,23 @@ public class MediaProvider extends ContentProvider {
     @Nullable
     private String getWhereClauseForMatchableVisibleFromFilePath(@NonNull Uri uri,
             @NonNull String column) {
-        if (isCallingPackageLegacyWrite() || checkCallingPermissionGlobal(uri, /*forWrite*/ true)) {
+        if (checkCallingPermissionGlobal(uri, /*forWrite*/ true)) {
             // No special filtering needed
             return null;
         }
 
-        final String callingPackage = getCallingPackageOrSelf();
-
-        final ArrayList<String> options = new ArrayList<>();
-        switch(matchUri(uri, isCallingPackageAllowedHidden())) {
-            case IMAGES_MEDIA_ID:
-            case IMAGES_MEDIA:
-            case IMAGES_THUMBNAILS_ID:
-            case IMAGES_THUMBNAILS:
-                if (checkCallingPermissionImages(/*forWrite*/ true, callingPackage)) {
-                    // No special filtering needed
-                    return null;
-                }
-                break;
-            case AUDIO_MEDIA_ID:
-            case AUDIO_MEDIA:
-            case AUDIO_PLAYLISTS_ID:
-            case AUDIO_PLAYLISTS:
-                if (checkCallingPermissionAudio(/*forWrite*/ true, callingPackage)) {
-                    // No special filtering needed
-                    return null;
-                }
-                break;
-            case VIDEO_MEDIA_ID:
-            case VIDEO_MEDIA:
-            case VIDEO_THUMBNAILS_ID:
-            case VIDEO_THUMBNAILS:
-                if (checkCallingPermissionVideo(/*firWrite*/ true, callingPackage)) {
-                    // No special filtering needed
-                    return null;
-                }
-                break;
-            case DOWNLOADS_ID:
-            case DOWNLOADS:
-                // No app has special permissions for downloads.
-                break;
-            case FILES_ID:
-            case FILES:
-                if (checkCallingPermissionAudio(/*forWrite*/ true, callingPackage)) {
-                    // Allow apps with audio permission to include audio* media types.
-                    options.add(DatabaseUtils.bindSelection("media_type=?",
-                            FileColumns.MEDIA_TYPE_AUDIO));
-                    options.add(DatabaseUtils.bindSelection("media_type=?",
-                            FileColumns.MEDIA_TYPE_PLAYLIST));
-                    options.add(DatabaseUtils.bindSelection("media_type=?",
-                            FileColumns.MEDIA_TYPE_SUBTITLE));
-                }
-                if (checkCallingPermissionVideo(/*forWrite*/ true, callingPackage)) {
-                    // Allow apps with video permission to include video* media types.
-                    options.add(DatabaseUtils.bindSelection("media_type=?",
-                            FileColumns.MEDIA_TYPE_VIDEO));
-                    options.add(DatabaseUtils.bindSelection("media_type=?",
-                            FileColumns.MEDIA_TYPE_SUBTITLE));
-                }
-                if (checkCallingPermissionImages(/*forWrite*/ true, callingPackage)) {
-                    // Allow apps with images permission to include images* media types.
-                    options.add(DatabaseUtils.bindSelection("media_type=?",
-                            FileColumns.MEDIA_TYPE_IMAGE));
-                }
-                break;
-            default:
-                // is_pending, is_trashed are not applicable for rest of the media tables.
-                return null;
+        int uriType = matchUri(uri, isCallingPackageAllowedHidden());
+        if (hasAccessToCollection(mCallingIdentity.get(), uriType, /* forWrite */ true)) {
+            // has direct write access to whole collection, no special filtering needed.
+            return null;
         }
 
-        final String matchSharedPackagesClause = FileColumns.OWNER_PACKAGE_NAME + " IN "
-                + getSharedPackages();
-        options.add(DatabaseUtils.bindSelection(matchSharedPackagesClause));
+        final String writeAccessCheckSql = getWhereForConstrainedAccess(mCallingIdentity.get(),
+                uriType, /* forWrite */ true, Bundle.EMPTY);
 
-        if (column.equalsIgnoreCase(MediaColumns.IS_PENDING)) {
-            // Include all pending files from Fuse
-            options.add(MATCH_PENDING_FROM_FUSE);
-        }
+        final String matchWritableRowsClause = String.format("%s=0 OR (%s=1 AND (%s OR %s))",
+                column, column, MATCH_PENDING_FROM_FUSE, writeAccessCheckSql);
 
-        final String matchWritableRowsClause = String.format("%s=0 OR (%s=1 AND %s)", column,
-                column, TextUtils.join(" OR ", options));
         return matchWritableRowsClause;
     }
 
@@ -2980,11 +2920,11 @@ public class MediaProvider extends ContentProvider {
 
     private ArrayList<String> getIncludedDefaultDirectories() {
         final ArrayList<String> includedDefaultDirs = new ArrayList<>();
-        if (checkCallingPermissionVideo(/* forWrite */ true, null)) {
+        if (mCallingIdentity.get().checkCallingPermissionVideo(/* forWrite */ true)) {
             includedDefaultDirs.add(Environment.DIRECTORY_DCIM);
             includedDefaultDirs.add(Environment.DIRECTORY_PICTURES);
             includedDefaultDirs.add(Environment.DIRECTORY_MOVIES);
-        } else if (checkCallingPermissionImages(/* forWrite */ true, null)) {
+        } else if (mCallingIdentity.get().checkCallingPermissionImages(/* forWrite */ true)) {
             includedDefaultDirs.add(Environment.DIRECTORY_DCIM);
             includedDefaultDirs.add(Environment.DIRECTORY_PICTURES);
         }
@@ -4863,7 +4803,7 @@ public class MediaProvider extends ContentProvider {
      */
     private String getAllowedPackagesForUpsert(@Nullable String givenOwnerPackage) {
         ArrayList<String> packages = new ArrayList<>(
-                Arrays.asList(mCallingIdentity.get().getSharedPackageNames()));
+                Arrays.asList(mCallingIdentity.get().getSharedPackageNamesArray()));
 
         // If givenOwnerPackage is CallingIdentity, packages list would already have shared package
         // names of givenOwnerPackage. If givenOwnerPackage is not CallingIdentity, since
@@ -5365,12 +5305,6 @@ public class MediaProvider extends ContentProvider {
         return getCachedCallingIdentityForFuse(uid);
     }
 
-    @Deprecated
-    private String getSharedPackages() {
-        final String[] sharedPackageNames = mCallingIdentity.get().getSharedPackageNames();
-        return bindList((Object[]) sharedPackageNames);
-    }
-
     /**
      * Gets shared packages names for given {@code packageName}
      */
@@ -5442,6 +5376,14 @@ public class MediaProvider extends ContentProvider {
             default: throw new IllegalStateException();
         }
 
+        if (forWrite) {
+            final Uri redactedUri = extras.getParcelable(QUERY_ARG_REDACTED_URI);
+            if (redactedUri != null) {
+                throw new UnsupportedOperationException(
+                        "Writes on: " + redactedUri.toString() + " are not supported");
+            }
+        }
+
         final SQLiteQueryBuilder qb = new SQLiteQueryBuilder();
         if (uri.getBooleanQueryParameter("distinct", false)) {
             qb.setDistinct(true);
@@ -5464,32 +5406,11 @@ public class MediaProvider extends ContentProvider {
         } else {
             includeVolumes = bindList(volumeName);
         }
-        final String sharedPackages = getSharedPackages();
-        final String matchSharedPackagesClause = FileColumns.OWNER_PACKAGE_NAME + " IN "
-                + sharedPackages;
-
-        boolean allowGlobal;
-        final Uri redactedUri = extras.getParcelable(QUERY_ARG_REDACTED_URI);
-        if (redactedUri != null) {
-            if (forWrite) {
-                throw new UnsupportedOperationException(
-                        "Writes on: " + redactedUri.toString() + " are not supported");
-            }
-            allowGlobal = checkCallingPermissionGlobal(redactedUri, false);
-        } else {
-            allowGlobal = checkCallingPermissionGlobal(uri, forWrite);
-        }
-
-        final boolean allowLegacy =
-                forWrite ? isCallingPackageLegacyWrite() : isCallingPackageLegacyRead();
-        final boolean allowLegacyRead = allowLegacy && !forWrite;
 
         int matchPending = extras.getInt(QUERY_ARG_MATCH_PENDING, MATCH_DEFAULT);
         int matchTrashed = extras.getInt(QUERY_ARG_MATCH_TRASHED, MATCH_DEFAULT);
         int matchFavorite = extras.getInt(QUERY_ARG_MATCH_FAVORITE, MATCH_DEFAULT);
 
-        final ArrayList<String> includedDefaultDirs = extras.getStringArrayList(
-                INCLUDED_DEFAULT_DIRECTORIES);
 
         // Handle callers using legacy arguments
         if (MediaStore.getIncludePending(uri)) matchPending = MATCH_INCLUDE;
@@ -5514,7 +5435,8 @@ public class MediaProvider extends ContentProvider {
         // Only accept ALL_VOLUMES parameter up until R, because we're not convinced we want
         // to commit to this as an API.
         final boolean includeAllVolumes = shouldIncludeRecentlyUnmountedVolumes(uri, extras);
-        final String callingPackage = getCallingPackageOrSelf();
+
+        appendAccessCheckQuery(qb, forWrite, uri, match, extras);
 
         switch (match) {
             case IMAGES_MEDIA_ID:
@@ -5533,9 +5455,6 @@ public class MediaProvider extends ContentProvider {
                             getProjectionMap(Images.Media.class, Files.FileColumns.class));
                     appendWhereStandalone(qb, FileColumns.MEDIA_TYPE + "=?",
                             FileColumns.MEDIA_TYPE_IMAGE);
-                }
-                if (!allowGlobal && !checkCallingPermissionImages(forWrite, callingPackage)) {
-                    appendWhereStandalone(qb, matchSharedPackagesClause);
                 }
                 appendWhereStandaloneMatch(qb, FileColumns.IS_PENDING, matchPending, uri);
                 appendWhereStandaloneMatch(qb, FileColumns.IS_TRASHED, matchTrashed, uri);
@@ -5562,11 +5481,6 @@ public class MediaProvider extends ContentProvider {
                         "NULL AS " + Images.Thumbnails.THUMB_DATA);
                 qb.setProjectionMap(projectionMap);
 
-                if (!allowGlobal && !checkCallingPermissionImages(forWrite, callingPackage)) {
-                    appendWhereStandalone(qb,
-                            "image_id IN (SELECT _id FROM images WHERE "
-                                    + matchSharedPackagesClause + ")");
-                }
                 break;
             }
             case AUDIO_MEDIA_ID:
@@ -5585,14 +5499,6 @@ public class MediaProvider extends ContentProvider {
                             getProjectionMap(Audio.Media.class, Files.FileColumns.class));
                     appendWhereStandalone(qb, FileColumns.MEDIA_TYPE + "=?",
                             FileColumns.MEDIA_TYPE_AUDIO);
-                }
-                if (!allowGlobal && !checkCallingPermissionAudio(forWrite, callingPackage)) {
-                    // Apps without Audio permission can only see their own
-                    // media, but we also let them see ringtone-style media to
-                    // support legacy use-cases.
-                    appendWhereStandalone(qb,
-                            DatabaseUtils.bindSelection(matchSharedPackagesClause
-                                    + " OR is_ringtone=1 OR is_alarm=1 OR is_notification=1"));
                 }
                 appendWhereStandaloneFilter(qb, new String[] {
                         AudioColumns.ARTIST_KEY, AudioColumns.ALBUM_KEY, AudioColumns.TITLE_KEY
@@ -5622,11 +5528,6 @@ public class MediaProvider extends ContentProvider {
                 }
                 appendWhereStandalone(qb, "_id IN (SELECT genre_id FROM " +
                         "audio WHERE _id=?)", uri.getPathSegments().get(3));
-                if (!allowGlobal && !checkCallingPermissionAudio(false, callingPackage)) {
-                    // We don't have a great way to filter parsed metadata by
-                    // owner, so callers need to hold READ_MEDIA_AUDIO
-                    appendWhereStandalone(qb, "0");
-                }
                 break;
             }
             case AUDIO_GENRES_ID:
@@ -5635,11 +5536,6 @@ public class MediaProvider extends ContentProvider {
             case AUDIO_GENRES: {
                 qb.setTables("audio_genres");
                 qb.setProjectionMap(getProjectionMap(Audio.Genres.class));
-                if (!allowGlobal && !checkCallingPermissionAudio(false, callingPackage)) {
-                    // We don't have a great way to filter parsed metadata by
-                    // owner, so callers need to hold READ_MEDIA_AUDIO
-                    appendWhereStandalone(qb, "0");
-                }
                 break;
             }
             case AUDIO_GENRES_ID_MEMBERS:
@@ -5660,11 +5556,6 @@ public class MediaProvider extends ContentProvider {
                 appendWhereStandaloneFilter(qb, new String[] {
                         AudioColumns.ARTIST_KEY, AudioColumns.ALBUM_KEY, AudioColumns.TITLE_KEY
                 }, filter);
-                if (!allowGlobal && !checkCallingPermissionAudio(false, callingPackage)) {
-                    // We don't have a great way to filter parsed metadata by
-                    // owner, so callers need to hold READ_MEDIA_AUDIO
-                    appendWhereStandalone(qb, "0");
-                }
                 // In order to be consistent with other audio views like audio_artist, audio_albums,
                 // and audio_genres, exclude pending and trashed item
                 appendWhereStandaloneMatch(qb, FileColumns.IS_PENDING, MATCH_EXCLUDE, uri);
@@ -5694,9 +5585,6 @@ public class MediaProvider extends ContentProvider {
                             getProjectionMap(Audio.Playlists.class, Files.FileColumns.class));
                     appendWhereStandalone(qb, FileColumns.MEDIA_TYPE + "=?",
                             FileColumns.MEDIA_TYPE_PLAYLIST);
-                }
-                if (!allowGlobal && !checkCallingPermissionAudio(forWrite, callingPackage)) {
-                    appendWhereStandalone(qb, matchSharedPackagesClause);
                 }
                 appendWhereStandaloneMatch(qb, FileColumns.IS_PENDING, matchPending, uri);
                 appendWhereStandaloneMatch(qb, FileColumns.IS_TRASHED, matchTrashed, uri);
@@ -5741,11 +5629,6 @@ public class MediaProvider extends ContentProvider {
                 appendWhereStandaloneFilter(qb, new String[] {
                         AudioColumns.ARTIST_KEY, AudioColumns.ALBUM_KEY, AudioColumns.TITLE_KEY
                 }, filter);
-                if (!allowGlobal && !checkCallingPermissionAudio(false, callingPackage)) {
-                    // We don't have a great way to filter parsed metadata by
-                    // owner, so callers need to hold READ_MEDIA_AUDIO
-                    appendWhereStandalone(qb, "0");
-                }
                 break;
             }
             case AUDIO_ALBUMART_ID:
@@ -5760,11 +5643,6 @@ public class MediaProvider extends ContentProvider {
                         "album_id AS " + Audio.Thumbnails._ID);
                 qb.setProjectionMap(projectionMap);
 
-                if (!allowGlobal && !checkCallingPermissionAudio(false, callingPackage)) {
-                    // We don't have a great way to filter parsed metadata by
-                    // owner, so callers need to hold READ_MEDIA_AUDIO
-                    appendWhereStandalone(qb, "0");
-                }
                 break;
             }
             case AUDIO_ARTISTS_ID_ALBUMS: {
@@ -5780,11 +5658,6 @@ public class MediaProvider extends ContentProvider {
                 appendWhereStandaloneFilter(qb, new String[] {
                         AudioColumns.ALBUM_KEY
                 }, filter);
-                if (!allowGlobal && !checkCallingPermissionAudio(false, callingPackage)) {
-                    // We don't have a great way to filter parsed metadata by
-                    // owner, so callers need to hold READ_MEDIA_AUDIO
-                    appendWhereStandalone(qb, "0");
-                }
                 break;
             }
             case AUDIO_ARTISTS_ID:
@@ -5800,11 +5673,6 @@ public class MediaProvider extends ContentProvider {
                 appendWhereStandaloneFilter(qb, new String[] {
                         AudioColumns.ARTIST_KEY
                 }, filter);
-                if (!allowGlobal && !checkCallingPermissionAudio(false, callingPackage)) {
-                    // We don't have a great way to filter parsed metadata by
-                    // owner, so callers need to hold READ_MEDIA_AUDIO
-                    appendWhereStandalone(qb, "0");
-                }
                 break;
             }
             case AUDIO_ALBUMS_ID:
@@ -5820,11 +5688,6 @@ public class MediaProvider extends ContentProvider {
                 appendWhereStandaloneFilter(qb, new String[] {
                         AudioColumns.ARTIST_KEY, AudioColumns.ALBUM_KEY
                 }, filter);
-                if (!allowGlobal && !checkCallingPermissionAudio(false, callingPackage)) {
-                    // We don't have a great way to filter parsed metadata by
-                    // owner, so callers need to hold READ_MEDIA_AUDIO
-                    appendWhereStandalone(qb, "0");
-                }
                 break;
             }
             case VIDEO_MEDIA_ID:
@@ -5843,9 +5706,6 @@ public class MediaProvider extends ContentProvider {
                             getProjectionMap(Video.Media.class, Files.FileColumns.class));
                     appendWhereStandalone(qb, FileColumns.MEDIA_TYPE + "=?",
                             FileColumns.MEDIA_TYPE_VIDEO);
-                }
-                if (!allowGlobal && !checkCallingPermissionVideo(forWrite, callingPackage)) {
-                    appendWhereStandalone(qb, matchSharedPackagesClause);
                 }
                 appendWhereStandaloneMatch(qb, FileColumns.IS_PENDING, matchPending, uri);
                 appendWhereStandaloneMatch(qb, FileColumns.IS_TRASHED, matchTrashed, uri);
@@ -5866,11 +5726,6 @@ public class MediaProvider extends ContentProvider {
             case VIDEO_THUMBNAILS: {
                 qb.setTables("videothumbnails");
                 qb.setProjectionMap(getProjectionMap(Video.Thumbnails.class));
-                if (!allowGlobal && !checkCallingPermissionVideo(forWrite, callingPackage)) {
-                    appendWhereStandalone(qb,
-                            "video_id IN (SELECT _id FROM video WHERE " +
-                                    matchSharedPackagesClause + ")");
-                }
                 break;
             }
             case FILES_ID:
@@ -5881,47 +5736,6 @@ public class MediaProvider extends ContentProvider {
             case FILES: {
                 qb.setTables("files");
                 qb.setProjectionMap(getProjectionMap(Files.FileColumns.class));
-
-                final ArrayList<String> options = new ArrayList<>();
-                if (!allowGlobal && !allowLegacyRead) {
-                    options.add(DatabaseUtils.bindSelection(matchSharedPackagesClause));
-                    if (allowLegacy) {
-                        options.add(DatabaseUtils.bindSelection("volume_name=?",
-                                MediaStore.VOLUME_EXTERNAL_PRIMARY));
-                    }
-                    if (checkCallingPermissionAudio(forWrite, callingPackage)) {
-                        options.add(DatabaseUtils.bindSelection("media_type=?",
-                                FileColumns.MEDIA_TYPE_AUDIO));
-                        options.add(DatabaseUtils.bindSelection("media_type=?",
-                                FileColumns.MEDIA_TYPE_PLAYLIST));
-                        options.add(DatabaseUtils.bindSelection("media_type=?",
-                                FileColumns.MEDIA_TYPE_SUBTITLE));
-                        options.add(matchSharedPackagesClause
-                                + " AND media_type=0 AND mime_type LIKE 'audio/%'");
-                    }
-                    if (checkCallingPermissionVideo(forWrite, callingPackage)) {
-                        options.add(DatabaseUtils.bindSelection("media_type=?",
-                                FileColumns.MEDIA_TYPE_VIDEO));
-                        options.add(DatabaseUtils.bindSelection("media_type=?",
-                                FileColumns.MEDIA_TYPE_SUBTITLE));
-                        options.add(matchSharedPackagesClause
-                                + " AND media_type=0 AND mime_type LIKE 'video/%'");
-                    }
-                    if (checkCallingPermissionImages(forWrite, callingPackage)) {
-                        options.add(DatabaseUtils.bindSelection("media_type=?",
-                                FileColumns.MEDIA_TYPE_IMAGE));
-                        options.add(matchSharedPackagesClause
-                                + " AND media_type=0 AND mime_type LIKE 'image/%'");
-                    }
-                    if (includedDefaultDirs != null) {
-                        for (String defaultDir : includedDefaultDirs) {
-                            options.add(FileColumns.RELATIVE_PATH + " LIKE '" + defaultDir + "/%'");
-                        }
-                    }
-                }
-                if (options.size() > 0) {
-                    appendWhereStandalone(qb, TextUtils.join(" OR ", options));
-                }
 
                 appendWhereStandaloneFilter(qb, new String[] {
                         AudioColumns.ARTIST_KEY, AudioColumns.ALBUM_KEY, AudioColumns.TITLE_KEY
@@ -5956,18 +5770,6 @@ public class MediaProvider extends ContentProvider {
                     appendWhereStandalone(qb, FileColumns.IS_DOWNLOAD + "=1");
                 }
 
-                final ArrayList<String> options = new ArrayList<>();
-                if (!allowGlobal && !allowLegacyRead) {
-                    options.add(DatabaseUtils.bindSelection(matchSharedPackagesClause));
-                    if (allowLegacy) {
-                        options.add(DatabaseUtils.bindSelection("volume_name=?",
-                                MediaStore.VOLUME_EXTERNAL_PRIMARY));
-                    }
-                }
-                if (options.size() > 0) {
-                    appendWhereStandalone(qb, TextUtils.join(" OR ", options));
-                }
-
                 appendWhereStandaloneMatch(qb, FileColumns.IS_PENDING, matchPending, uri);
                 appendWhereStandaloneMatch(qb, FileColumns.IS_TRASHED, matchTrashed, uri);
                 appendWhereStandaloneMatch(qb, FileColumns.IS_FAVORITE, matchFavorite, uri);
@@ -5999,6 +5801,43 @@ public class MediaProvider extends ContentProvider {
         }
 
         return qb;
+    }
+
+    private void appendAccessCheckQuery(@NonNull SQLiteQueryBuilder qb, boolean forWrite,
+            @NonNull Uri uri, int uriType, @NonNull Bundle extras) {
+        Objects.requireNonNull(extras);
+        final Uri redactedUri = extras.getParcelable(QUERY_ARG_REDACTED_URI);
+
+        final boolean allowGlobal;
+        if (redactedUri != null) {
+            allowGlobal = checkCallingPermissionGlobal(redactedUri, false);
+        } else {
+            allowGlobal = checkCallingPermissionGlobal(uri, forWrite);
+        }
+
+        if (allowGlobal) {
+            return;
+        }
+
+        if (hasAccessToCollection(mCallingIdentity.get(), uriType, forWrite)) {
+            // has direct access to whole collection, no special filtering needed.
+            return;
+        }
+
+        final ArrayList<String> options = new ArrayList<>();
+        if (hasUserSelectedAccess(mCallingIdentity.get(), uriType, forWrite)) {
+            // If app has READ_MEDIA_VISUAL_USER_SELECTED permission, allow access on files granted
+            // via PhotoPicker launched for Permission. These grants are defined in media_grants
+            // table.
+            options.add(getWhereForUserSelectedAccess(mCallingIdentity.get(), uriType));
+        }
+
+        // Allow access to files which are owned by the caller. Or allow access to files based on
+        // legacy or any other special access permissions.
+        options.add(getWhereForConstrainedAccess(mCallingIdentity.get(), uriType, forWrite,
+                extras));
+
+        appendWhereStandalone(qb, TextUtils.join(" OR ", options));
     }
 
     /**
@@ -6615,6 +6454,22 @@ public class MediaProvider extends ContentProvider {
                 } finally {
                     restoreLocalCallingIdentity(token);
                 }
+            }
+            case MediaStore.GRANT_MEDIA_READ_FOR_PACKAGE_CALL: {
+                if (!checkPermissionSelf(Binder.getCallingUid())) {
+                    throw new SecurityException("Create media grants not allowed. "
+                            + " Calling app ID:" + UserHandle.getAppId(Binder.getCallingUid())
+                            + " Calling UID:" + Binder.getCallingUid()
+                            + " Media Provider app ID:" + UserHandle.getAppId(MY_UID)
+                            + " Media Provider UID:" + MY_UID);
+                }
+                final int packageUid = extras.getInt(Intent.EXTRA_UID);
+                final ArrayList<Uri> uris =
+                            extras.getParcelableArrayList(MediaStore.EXTRA_URI_LIST);
+                final PackageManager pm = getContext().getPackageManager();
+                final String packageName = pm.getNameForUid(packageUid);
+                mMediaGrants.addMediaGrantsForPackage(packageName, uris);
+                return null;
             }
             case MediaStore.CREATE_WRITE_REQUEST_CALL:
             case MediaStore.CREATE_FAVORITE_REQUEST_CALL:
@@ -7837,7 +7692,7 @@ public class MediaProvider extends ContentProvider {
                 final SQLiteQueryBuilder qbForReplace = getQueryBuilder(TYPE_DELETE,
                         matchUri(uri, allowHidden), uri, extras, null);
                 final long rowId = getIdIfPathOwnedByPackages(qbForReplace, helper, path,
-                        getSharedPackages());
+                        mCallingIdentity.get().getSharedPackagesAsString());
 
                 if (rowId != -1 && qbForReplace.delete(helper, "_id=?",
                         new String[] {Long.toString(rowId)}) == 1) {
@@ -9528,13 +9383,13 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
-     * Returns {@code true} if {@link #mCallingIdentity#getSharedPackages(String)} contains the
-     * given package name, {@code false} otherwise.
+     * Returns {@code true} if {@link #mCallingIdentity#getSharedPackageNamesList(String)} contains
+     * the given package name, {@code false} otherwise.
      * <p> Assumes that {@code mCallingIdentity} has been properly set to reflect the calling
      * package.
      */
     private boolean isCallingIdentitySharedPackageName(@NonNull String packageName) {
-        for (String sharedPkgName : mCallingIdentity.get().getSharedPackageNames()) {
+        for (String sharedPkgName : mCallingIdentity.get().getSharedPackageNamesArray()) {
             if (packageName.toLowerCase(Locale.ROOT)
                     .equals(sharedPkgName.toLowerCase(Locale.ROOT))) {
                 return true;
@@ -10183,38 +10038,6 @@ public class MediaProvider extends ContentProvider {
         return FuseDaemon.native_is_fuse_thread();
     }
 
-    @Deprecated
-    private boolean checkCallingPermissionAudio(boolean forWrite, String callingPackage) {
-        if (forWrite) {
-            return mCallingIdentity.get().hasPermission(PERMISSION_WRITE_AUDIO);
-        } else {
-            // write permission should be enough for reading as well
-            return mCallingIdentity.get().hasPermission(PERMISSION_READ_AUDIO)
-                    || mCallingIdentity.get().hasPermission(PERMISSION_WRITE_AUDIO);
-        }
-    }
-
-    @Deprecated
-    private boolean checkCallingPermissionVideo(boolean forWrite, String callingPackage) {
-        if (forWrite) {
-            return mCallingIdentity.get().hasPermission(PERMISSION_WRITE_VIDEO);
-        } else {
-            // write permission should be enough for reading as well
-            return mCallingIdentity.get().hasPermission(PERMISSION_READ_VIDEO)
-                    || mCallingIdentity.get().hasPermission(PERMISSION_WRITE_VIDEO);
-        }
-    }
-
-    @Deprecated
-    private boolean checkCallingPermissionImages(boolean forWrite, String callingPackage) {
-        if (forWrite) {
-            return mCallingIdentity.get().hasPermission(PERMISSION_WRITE_IMAGES);
-        } else {
-            // write permission should be enough for reading as well
-            return mCallingIdentity.get().hasPermission(PERMISSION_READ_IMAGES)
-                    || mCallingIdentity.get().hasPermission(PERMISSION_WRITE_IMAGES);
-        }
-    }
 
     /**
      * Enforce that caller has access to the given {@link Uri}.
@@ -10719,6 +10542,7 @@ public class MediaProvider extends ContentProvider {
 
     private MediaScanner mMediaScanner;
 
+    private ProjectionHelper mProjectionHelper;
     private DatabaseHelper mInternalDatabase;
     private DatabaseHelper mExternalDatabase;
     private PickerDbFacade mPickerDbFacade;
@@ -10727,6 +10551,7 @@ public class MediaProvider extends ContentProvider {
     private ConfigStore mConfigStore;
     private PickerSyncController mPickerSyncController;
     private TranscodeHelper mTranscodeHelper;
+    private MediaGrants mMediaGrants;
 
     // name of the volume currently being scanned by the media scanner (or null)
     private String mMediaScannerVolume;
@@ -10978,7 +10803,7 @@ public class MediaProvider extends ContentProvider {
     }
 
     public ArrayMap<String, String> getProjectionMap(Class<?>... clazzes) {
-        return mExternalDatabase.getProjectionMap(clazzes);
+        return mProjectionHelper.getProjectionMap(clazzes);
     }
 
     static <T> boolean containsAny(Set<T> a, Set<T> b) {
