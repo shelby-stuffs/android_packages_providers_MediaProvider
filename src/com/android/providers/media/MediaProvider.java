@@ -99,6 +99,7 @@ import static com.android.providers.media.util.FileUtils.sanitizePath;
 import static com.android.providers.media.util.FileUtils.toFuseFile;
 import static com.android.providers.media.util.Logging.LOGV;
 import static com.android.providers.media.util.Logging.TAG;
+import static com.android.providers.media.util.PermissionUtils.checkPermissionSelf;
 import static com.android.providers.media.util.SyntheticPathUtils.REDACTED_URI_ID_PREFIX;
 import static com.android.providers.media.util.SyntheticPathUtils.REDACTED_URI_ID_SIZE;
 import static com.android.providers.media.util.SyntheticPathUtils.createSparseFile;
@@ -172,6 +173,7 @@ import android.os.Parcelable;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.os.Trace;
 import android.os.UserHandle;
 import android.os.UserManager;
@@ -3594,10 +3596,14 @@ public class MediaProvider extends ContentProvider {
         }
 
         // TODO(b/195008831): Add test to verify that apps can't access
-        if (table == PICKER_INTERNAL_MEDIA) {
-            return mPickerDataLayer.fetchMedia(queryArgs);
-        } else if (table == PICKER_INTERNAL_ALBUMS) {
-            return mPickerDataLayer.fetchAlbums(queryArgs);
+        if (table == PICKER_INTERNAL_MEDIA_ALL) {
+            return mPickerDataLayer.fetchAllMedia(queryArgs);
+        } else if (table == PICKER_INTERNAL_MEDIA_LOCAL) {
+            return mPickerDataLayer.fetchLocalMedia(queryArgs);
+        } else if (table == PICKER_INTERNAL_ALBUMS_ALL) {
+            return mPickerDataLayer.fetchAllAlbums(queryArgs);
+        } else if (table == PICKER_INTERNAL_ALBUMS_LOCAL) {
+            return mPickerDataLayer.fetchLocalAlbums(queryArgs);
         }
 
         final DatabaseHelper helper = getDatabaseForUri(uri);
@@ -6634,9 +6640,17 @@ public class MediaProvider extends ContentProvider {
                 }
             case MediaStore.GET_CLOUD_PROVIDER_CALL: {
                 // TODO(b/245746037): replace UID check with Permission(MANAGE_CLOUD_MEDIA_PROVIDER)
-                if (Binder.getCallingUid() != MY_UID) {
-                    throw new SecurityException("Get cloud provider not allowed. Calling UID:"
-                            + Binder.getCallingUid() + ", MP UID:" + MY_UID);
+                // PhotoPickerSettingsActivity will run as either the primary or the managed user.
+                // Since the activity shows both personal and work tabs, it will have to make get
+                // cloud provider IPC call to both instances of Media Provider - one running as
+                // primary profile and the other as managed profile. Hence, UID check will not be
+                // feasible here.
+                if (!checkPermissionSelf(Binder.getCallingUid())) {
+                    throw new SecurityException("Get cloud provider not allowed. "
+                            + " Calling app ID:" + UserHandle.getAppId(Binder.getCallingUid())
+                            + " Calling UID:" + Binder.getCallingUid()
+                            + " Media Provider app ID:" + UserHandle.getAppId(MY_UID)
+                            + " Media Provider UID:" + MY_UID);
                 }
                 final Bundle bundle = new Bundle();
                 bundle.putString(MediaStore.GET_CLOUD_PROVIDER_RESULT,
@@ -8593,7 +8607,18 @@ public class MediaProvider extends ContentProvider {
             return daemon;
         }
     }
-
+  
+    protected boolean isFuseDaemonReadyForFilePath(@NonNull String filePath) {
+        FuseDaemon daemon = null;
+        try {
+            daemon = ExternalStorageServiceImpl.getFuseDaemon(
+                    getVolumeId(new File(filePath)));
+        } catch (FileNotFoundException e) {
+            Log.w(TAG, "No fuse daemon exists for path:" + filePath);
+        }
+        return daemon == null ? false : true;
+    }
+  
     @NonNull
     private FuseDaemon getFuseDaemonForPath(@NonNull String path)
             throws FileNotFoundException {
@@ -10625,7 +10650,14 @@ public class MediaProvider extends ContentProvider {
     protected boolean isStableUrisEnabled(String volumeName) {
         switch (volumeName) {
             case MediaStore.VOLUME_INTERNAL:
-                return mConfigStore.isStableUrisForInternalVolumeEnabled();
+                return mConfigStore.isStableUrisForInternalVolumeEnabled()
+                        || SystemProperties.getBoolean("persist.sys.fuse.backup.internal_db_backup",
+                        /* defaultValue */ false);
+            case MediaStore.VOLUME_EXTERNAL_PRIMARY:
+                return mConfigStore.isStableUrisForExternalVolumeEnabled()
+                        || SystemProperties.getBoolean(
+                        "persist.sys.fuse.backup.external_volume_backup",
+                        /* defaultValue */ false);
             default:
                 return false;
         }
@@ -10751,9 +10783,11 @@ public class MediaProvider extends ContentProvider {
 
     static final int PICKER = 900;
     static final int PICKER_ID = 901;
-    static final int PICKER_INTERNAL_MEDIA = 902;
-    static final int PICKER_INTERNAL_ALBUMS = 903;
-    static final int PICKER_UNRELIABLE_VOLUME = 904;
+    static final int PICKER_INTERNAL_MEDIA_ALL = 902;
+    static final int PICKER_INTERNAL_MEDIA_LOCAL = 903;
+    static final int PICKER_INTERNAL_ALBUMS_ALL = 904;
+    static final int PICKER_INTERNAL_ALBUMS_LOCAL = 905;
+    static final int PICKER_UNRELIABLE_VOLUME = 906;
 
     // MediaProvider Command Line Interface
     static final int CLI = 100_000;
@@ -10854,8 +10888,10 @@ public class MediaProvider extends ContentProvider {
             // NOTE: technically hidden, since Uri is never exposed
             mPublic.addURI(auth, "*/version", VERSION);
 
-            mHidden.addURI(auth, "picker_internal/media", PICKER_INTERNAL_MEDIA);
-            mHidden.addURI(auth, "picker_internal/albums", PICKER_INTERNAL_ALBUMS);
+            mHidden.addURI(auth, "picker_internal/media/all", PICKER_INTERNAL_MEDIA_ALL);
+            mHidden.addURI(auth, "picker_internal/media/local", PICKER_INTERNAL_MEDIA_LOCAL);
+            mHidden.addURI(auth, "picker_internal/albums/all", PICKER_INTERNAL_ALBUMS_ALL);
+            mHidden.addURI(auth, "picker_internal/albums/local", PICKER_INTERNAL_ALBUMS_LOCAL);
             mHidden.addURI(auth, "*", VOLUMES_ID);
             mHidden.addURI(auth, null, VOLUMES);
 
