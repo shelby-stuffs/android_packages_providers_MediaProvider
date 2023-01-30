@@ -105,6 +105,19 @@ public class MediaGrantsTest {
     }
 
     @Test
+    public void testAddDuplicateMediaGrants() throws Exception {
+
+        Long fileId1 = insertFileInResolver("test_file1");
+        List<Uri> uris = List.of(buildValidPickerUri(fileId1));
+        mGrants.addMediaGrantsForPackage(TEST_OWNER_PACKAGE_NAME, uris);
+        assertGrantExistsForPackage(fileId1, TEST_OWNER_PACKAGE_NAME);
+
+        // Add the same grant again to ensure no database insert failure.
+        mGrants.addMediaGrantsForPackage(TEST_OWNER_PACKAGE_NAME, uris);
+        assertGrantExistsForPackage(fileId1, TEST_OWNER_PACKAGE_NAME);
+    }
+
+    @Test
     public void testAddMediaGrantsRequiresPickerUri() throws Exception {
 
         Uri invalidUri =
@@ -165,6 +178,42 @@ public class MediaGrantsTest {
                 () -> {
                     mGrants.removeAllMediaGrantsForPackage("");
                 });
+    }
+
+    @Test
+    public void removeAllMediaGrants() throws Exception {
+
+        final String secondPackageName = "com.android.test.another.package";
+        Long fileId1 = insertFileInResolver("test_file1");
+        Long fileId2 = insertFileInResolver("test_file2");
+        List<Uri> uris = List.of(buildValidPickerUri(fileId1), buildValidPickerUri(fileId2));
+        mGrants.addMediaGrantsForPackage(TEST_OWNER_PACKAGE_NAME, uris);
+        mGrants.addMediaGrantsForPackage(secondPackageName, uris);
+
+        assertGrantExistsForPackage(fileId1, TEST_OWNER_PACKAGE_NAME);
+        assertGrantExistsForPackage(fileId2, TEST_OWNER_PACKAGE_NAME);
+        assertGrantExistsForPackage(fileId1, secondPackageName);
+        assertGrantExistsForPackage(fileId2, secondPackageName);
+
+        int removed = mGrants.removeAllMediaGrants();
+        assertEquals(4, removed);
+
+        try (Cursor c =
+                mExternalDatabase.runWithTransaction(
+                        (db) ->
+                                db.query(
+                                        MediaGrants.MEDIA_GRANTS_TABLE,
+                                        new String[] {
+                                            MediaGrants.FILE_ID_COLUMN,
+                                            MediaGrants.OWNER_PACKAGE_NAME_COLUMN
+                                        },
+                                        null,
+                                        null,
+                                        null,
+                                        null,
+                                        null))) {
+            assertEquals(0, c.getCount());
+        }
     }
 
     @Test
