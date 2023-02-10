@@ -55,6 +55,7 @@ import com.android.providers.media.R;
 import com.android.providers.media.photopicker.PhotoPickerActivity;
 import com.android.providers.media.photopicker.data.Selection;
 import com.android.providers.media.photopicker.data.UserIdManager;
+import com.android.providers.media.photopicker.viewmodel.BannerViewModel;
 import com.android.providers.media.photopicker.viewmodel.PickerViewModel;
 
 import com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton;
@@ -68,6 +69,7 @@ import java.util.Locale;
 public abstract class TabFragment extends Fragment {
 
     protected PickerViewModel mPickerViewModel;
+    protected BannerViewModel mBannerViewModel;
     protected Selection mSelection;
     protected ImageLoader mImageLoader;
     protected AutoFitRecyclerView mRecyclerView;
@@ -117,7 +119,9 @@ public abstract class TabFragment extends Fragment {
         mImageLoader = new ImageLoader(context);
         mRecyclerView = view.findViewById(R.id.picker_tab_recyclerview);
         mRecyclerView.setHasFixedSize(true);
-        mPickerViewModel = new ViewModelProvider(requireActivity()).get(PickerViewModel.class);
+        final ViewModelProvider viewModelProvider = new ViewModelProvider(requireActivity());
+        mPickerViewModel = viewModelProvider.get(PickerViewModel.class);
+        mBannerViewModel = viewModelProvider.get(BannerViewModel.class);
         mSelection = mPickerViewModel.getSelection();
         mRecyclerViewBottomPadding = getResources().getDimensionPixelSize(
                 R.dimen.picker_recycler_view_bottom_padding);
@@ -420,10 +424,6 @@ public abstract class TabFragment extends Fragment {
         return TextUtils.expandTemplate(template, sizeString).toString();
     }
 
-    protected final void observeAndUpdateBannerVisibility(@NonNull TabAdapter adapter) {
-        mPickerViewModel.getBannerVisibilityLiveData().observe(this, adapter::setShowBanner);
-    }
-
     protected final PhotoPickerActivity getPickerActivity() {
         return (PhotoPickerActivity) getActivity();
     }
@@ -447,4 +447,22 @@ public abstract class TabFragment extends Fragment {
         layoutManager.setSpanSizeLookup(lookup);
         mRecyclerView.setLayoutManager(layoutManager);
     }
+
+    protected final TabAdapter.OnBannerClickListener mOnChooseAppBannerClickListener =
+            new TabAdapter.OnBannerClickListener() {
+                @Override
+                public void onActionButtonClick() {
+                    dismissBanner();
+                    getPickerActivity().startSettingsActivity();
+                }
+
+                @Override
+                public void onDismissButtonClick() {
+                    dismissBanner();
+                }
+
+                private void dismissBanner() {
+                    mBannerViewModel.onUserDismissedChooseAppBanner();
+                }
+            };
 }
