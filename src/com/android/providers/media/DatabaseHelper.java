@@ -540,7 +540,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         }
         String volumeName =
                 isInternal() ? MediaStore.VOLUME_INTERNAL : MediaStore.VOLUME_EXTERNAL;
-        if (!isInternal() || !mediaProvider.isStableUrisEnabled(volumeName)) {
+        if (!isInternal()
+                || !mediaProvider.getDatabaseBackupAndRecovery().isStableUrisEnabled(volumeName)) {
             return;
         }
 
@@ -554,7 +555,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 // StableUrisIdleMaintenanceService will be attempted to run only once in 7days.
                 // Any rollback before that will not recover DB rows.
                 BackgroundThread.getExecutor().execute(
-                        () -> mediaProvider.backupInternalDatabase(null));
+                        () -> mediaProvider.getDatabaseBackupAndRecovery()
+                                .backupInternalDatabase(null));
                 // Set next row id in External Storage to handle rollback in future.
                 backupNextRowId(NEXT_ROW_ID_DEFAULT_BILLION_VALUE);
                 updateSessionIdInDatabaseAndExternalStorage(db);
@@ -607,13 +609,16 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         final String fuseFilePath = getFuseFilePathFromVolumeName(volumeName);
         // Wait for external primary to be attached as we use same thread for internal volume.
         // Maximum wait for 10s
-        while (!mediaProvider.isFuseDaemonReadyForFilePath(fuseFilePath) && i < 1000) {
+        DatabaseBackupAndRecovery dbBackupAndRecovery =
+                mediaProvider.getDatabaseBackupAndRecovery();
+        while (!dbBackupAndRecovery.isFuseDaemonReadyForFilePath(fuseFilePath)
+                && i < 1000) {
             Log.d(TAG, "Waiting for fuse daemon to be ready.");
             // Poll after every 10ms
             SystemClock.sleep(10);
             i++;
         }
-        if (!mediaProvider.isFuseDaemonReadyForFilePath(fuseFilePath)) {
+        if (!dbBackupAndRecovery.isFuseDaemonReadyForFilePath(fuseFilePath)) {
             Log.e(TAG, "Could not recover data as fuse daemon could not serve requests.");
             return;
         }
@@ -623,15 +628,15 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         String lastReadValue = "";
 
         while (true) {
-            backedUpFilePaths = mediaProvider.readBackedUpFilePaths(volumeName, lastReadValue,
-                    LEVEL_DB_READ_LIMIT);
+            backedUpFilePaths = mediaProvider.getDatabaseBackupAndRecovery()
+                            .readBackedUpFilePaths(volumeName, lastReadValue, LEVEL_DB_READ_LIMIT);
             if (backedUpFilePaths.length <= 0) {
                 break;
             }
 
             for (String filePath : backedUpFilePaths) {
-                Optional<BackupIdRow> fileRow = mediaProvider.readDataFromBackup(volumeName,
-                        filePath);
+                Optional<BackupIdRow> fileRow = mediaProvider.getDatabaseBackupAndRecovery()
+                                .readDataFromBackup(volumeName, filePath);
                 if (fileRow.isPresent() && !fileRow.get().getIsDirty()) {
                     insertDataInDatabase(db, fileRow.get(), filePath, volumeName);
                     rowsRecovered++;
@@ -1174,7 +1179,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                     "CREATE TABLE media_grants ("
                             + "owner_package_name TEXT,"
                             + "file_id INTEGER,"
-                            + "UNIQUE(owner_package_name, file_id)"
+                            + "UNIQUE(owner_package_name, file_id) ON CONFLICT IGNORE "
                             + "FOREIGN KEY (file_id)"
                             + "  REFERENCES files(_id)"
                             + "  ON DELETE CASCADE"
@@ -1934,11 +1939,12 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     }
 
     private static void updateAddMediaGrantsTable(SQLiteDatabase db) {
+        db.execSQL("DROP TABLE IF EXISTS media_grants");
         db.execSQL(
                 "CREATE TABLE media_grants ("
                         + "owner_package_name TEXT,"
                         + "file_id INTEGER,"
-                        + "UNIQUE(owner_package_name, file_id)"
+                        + "UNIQUE(owner_package_name, file_id) ON CONFLICT IGNORE "
                         + "FOREIGN KEY (file_id)"
                         + "  REFERENCES files(_id)"
                         + "  ON DELETE CASCADE"
@@ -2015,7 +2021,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     static final int VERSION_T = 1308;
     // Leave some gaps in database version tagging to allow T schema changes
     // to go independent of U schema changes.
-    static final int VERSION_U = 1401;
+    static final int VERSION_U = 1402;
     public static final int VERSION_LATEST = VERSION_U;
 
     /**
@@ -2218,7 +2224,9 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             if (fromVersion < 1400) {
                 // Empty version bump to ensure triggers are recreated
             }
-            if (fromVersion < 1401) {
+            // 1401 is intentionally skipped here, media_grants
+            // table changes will be updated in 1402.
+            if (fromVersion < 1402) {
                 if (isExternal()) {
                     updateAddMediaGrantsTable(db);
                 }

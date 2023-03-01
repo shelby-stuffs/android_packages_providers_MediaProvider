@@ -2360,13 +2360,18 @@ bool FuseDaemon::IsStarted() const {
 }
 
 bool IsFuseBpfEnabled() {
-    std::string bpf_override = android::base::GetProperty("persist.sys.fuse.bpf.override", "");
-    if (bpf_override == "true") {
-        return true;
-    } else if (bpf_override == "false") {
-        return false;
+    // TODO b/262887267 Once kernel supports flag, trigger off kernel flag unless
+    //      ro.fuse.bpf.enabled is explicitly set to false
+
+    // ro.fuse.bpf.is_running may not be set when first reading this property, so we have to
+    // reproduce the vold/Utils.cpp:isFuseBpfEnabled() logic here
+    if (android::base::GetProperty("ro.fuse.bpf.is_running", "") != "") {
+        return android::base::GetBoolProperty("ro.fuse.bpf.is_running", false);
+    } else if (android::base::GetProperty("persist.sys.fuse.bpf.override", "") != "") {
+        return android::base::GetBoolProperty("persist.sys.fuse.bpf.override", false);
+    } else {
+        return android::base::GetBoolProperty("ro.fuse.bpf.enabled", false);
     }
-    return android::base::GetBoolProperty("ro.fuse.bpf.enabled", false);
 }
 
 void FuseDaemon::Start(android::base::unique_fd fd, const std::string& path,
@@ -2400,15 +2405,17 @@ void FuseDaemon::Start(android::base::unique_fd fd, const std::string& path,
     bool bpf_enabled = IsFuseBpfEnabled();
     int bpf_fd = -1;
     if (bpf_enabled) {
-        LOG(INFO) << "Using FUSE BPF";
-
         bpf_fd = android::bpf::bpfFdGet(FUSE_BPF_PROG_PATH, BPF_F_RDONLY);
         if (bpf_fd < 0) {
             PLOG(ERROR) << "Failed to fetch BPF prog fd: " << bpf_fd;
             bpf_enabled = false;
         } else {
-            LOG(INFO) << "BPF prog fd fetched";
+            LOG(INFO) << "Using FUSE BPF, BPF prog fd fetched";
         }
+    }
+
+    if (!bpf_enabled) {
+        LOG(INFO) << "Not using FUSE BPF";
     }
 
     struct fuse fuse_default(path, stat.st_ino, uncached_mode, bpf_enabled, bpf_fd,
@@ -2545,29 +2552,45 @@ void FuseDaemon::SetupLevelDbInstances() {
     }
 }
 
+std::string deriveVolumeName(const std::string& path) {
+    std::string volume_name;
+    if (!android::base::StartsWith(path, STORAGE_PREFIX)) {
+        volume_name = VOLUME_INTERNAL;
+    } else if (android::base::StartsWith(path, PRIMARY_VOLUME_PREFIX)) {
+        volume_name = VOLUME_EXTERNAL_PRIMARY;
+    } else {
+        size_t size = sizeof(STORAGE_PREFIX) / sizeof(STORAGE_PREFIX[0]);
+        volume_name = volume_name.substr(size);
+    }
+    return volume_name;
+}
+
 void FuseDaemon::DeleteFromLevelDb(const std::string& key) {
-    if (!android::base::StartsWith(key, STORAGE_PREFIX) &&
-        CheckLevelDbConnection(VOLUME_INTERNAL)) {
-        leveldb::Status status;
-        status = fuse->level_db_connection_map[VOLUME_INTERNAL]->Delete(leveldb::WriteOptions(),
-                                                                        key);
-        if (!status.ok()) {
-            LOG(INFO) << "Failure in leveldb delete for key: " << key;
-        }
+    std::string volume_name = deriveVolumeName(key);
+    if (!CheckLevelDbConnection(volume_name)) {
+        LOG(ERROR) << "Failure in leveldb delete in volume:" << volume_name << " for key:" << key;
+        return;
+    }
+
+    leveldb::Status status;
+    status = fuse->level_db_connection_map[VOLUME_INTERNAL]->Delete(leveldb::WriteOptions(), key);
+    if (!status.ok()) {
+        LOG(ERROR) << "Failure in leveldb delete for key: " << key <<
+            " from volume:" << volume_name;
     }
 }
 
 void FuseDaemon::InsertInLevelDb(const std::string& key, const std::string& value) {
-    if (!android::base::StartsWith(key, STORAGE_PREFIX) &&
-        CheckLevelDbConnection(VOLUME_INTERNAL)) {
-        leveldb::Status status;
-        status = fuse->level_db_connection_map[VOLUME_INTERNAL]->Put(leveldb::WriteOptions(), key,
-                                                                     value);
-        if (!status.ok()) {
-            LOG(ERROR) << "Failure in leveldb insert for key: " << key << status.ToString();
-        } else {
-            LOG(INFO) << "Insert successful for key:" << key;
-        }
+    std::string volume_name = deriveVolumeName(key);
+    if (!CheckLevelDbConnection(volume_name)) {
+        LOG(ERROR) << "Failure in leveldb insert in volume:" << volume_name << " for key:" << key;
+        return;
+    }
+
+    leveldb::Status status;
+    status = fuse->level_db_connection_map[volume_name]->Put(leveldb::WriteOptions(), key, value);
+    if (!status.ok()) {
+        LOG(ERROR) << "Failure in leveldb insert for key: " << key << " in volume:" << volume_name;
     }
 }
 
