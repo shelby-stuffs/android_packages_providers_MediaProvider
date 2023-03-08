@@ -16,6 +16,8 @@
 
 package com.android.providers.media;
 
+import static com.android.providers.media.DatabaseBackupAndRecovery.getXattr;
+import static com.android.providers.media.DatabaseBackupAndRecovery.setXattr;
 import static com.android.providers.media.MediaProviderStatsLog.MEDIA_PROVIDER_VOLUME_RECOVERY_REPORTED__VOLUME__EXTERNAL_PRIMARY;
 import static com.android.providers.media.MediaProviderStatsLog.MEDIA_PROVIDER_VOLUME_RECOVERY_REPORTED__VOLUME__INTERNAL;
 import static com.android.providers.media.MediaProviderStatsLog.MEDIA_PROVIDER_VOLUME_RECOVERY_REPORTED__VOLUME__PUBLIC;
@@ -40,7 +42,6 @@ import android.mtp.MtpConstants;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
-import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.os.SystemClock;
 import android.os.SystemProperties;
@@ -84,7 +85,6 @@ import java.io.FileNotFoundException;
 import java.io.FilenameFilter;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
@@ -663,7 +663,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                         continue;
                     }
 
-                    insertDataInDatabase(db, fileRow.get(), filePath, volumeName);
+                    dbBackupAndRecovery.insertDataInDatabase(db, fileRow.get(), filePath,
+                            volumeName);
                     rowsRecovered++;
                 }
             }
@@ -700,24 +701,6 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             default:
                 return "/storage/" + volumeName;
         }
-    }
-
-    private void insertDataInDatabase(SQLiteDatabase db, BackupIdRow row, String filePath,
-            String volumeName) {
-        final ContentValues values = createValuesFromFileRow(row, filePath, volumeName);
-        if (db.insert("files", null, values) == -1) {
-            Log.e(TAG, "Failed to insert " + values + "; continuing");
-        }
-    }
-
-    private ContentValues createValuesFromFileRow(BackupIdRow row, String filePath,
-            String volumeName) {
-        ContentValues values = new ContentValues();
-        values.put(FileColumns._ID, row.getId());
-        values.put(FileColumns.IS_FAVORITE, row.getIsFavorite());
-        values.put(FileColumns.DATA, filePath);
-        values.put(FileColumns.VOLUME_NAME, volumeName);
-        return values;
     }
 
     private void tryRecoverRowIdSequence(SQLiteDatabase db) {
@@ -1216,6 +1199,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                     "CREATE TABLE media_grants ("
                             + "owner_package_name TEXT,"
                             + "file_id INTEGER,"
+                            + "package_user_id INTEGER,"
                             + "UNIQUE(owner_package_name, file_id) ON CONFLICT IGNORE "
                             + "FOREIGN KEY (file_id)"
                             + "  REFERENCES files(_id)"
@@ -1690,7 +1674,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         final String insertArg =
                 "new.volume_name||':'||new._id||':'||new.media_type||':'||new"
                         + ".is_download||':'||new.is_pending||':'||new.is_trashed||':'||new"
-                        + ".is_favorite||':'||new._user_id||':'||new.date_expires||':'||new._data";
+                        + ".is_favorite||':'||new._user_id||':'||ifnull(new.date_expires,'null')"
+                        + "||':'||new._data";
         final String updateArg =
                 "old.volume_name||':'||old._id||':'||old.media_type||':'||old.is_download"
                         + "||':'||new._id||':'||new.media_type||':'||new.is_download"
@@ -1704,8 +1689,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                         + "||':'||ifnull(new.owner_package_name,'null')"
                         + "||':'||ifnull(old._user_id,0)"
                         + "||':'||ifnull(new._user_id,0)"
-                        + "||':'||old.date_expires"
-                        + "||':'||new.date_expires"
+                        + "||':'||ifnull(old.date_expires,'null')"
+                        + "||':'||ifnull(new.date_expires,'null')"
                         + "||':'||old._data";
         final String deleteArg =
                 "old.volume_name||':'||old._id||':'||old.media_type||':'||old.is_download"
@@ -1987,6 +1972,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 "CREATE TABLE media_grants ("
                         + "owner_package_name TEXT,"
                         + "file_id INTEGER,"
+                        + "package_user_id INTEGER,"
                         + "UNIQUE(owner_package_name, file_id) ON CONFLICT IGNORE "
                         + "FOREIGN KEY (file_id)"
                         + "  REFERENCES files(_id)"
@@ -2064,7 +2050,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     static final int VERSION_T = 1308;
     // Leave some gaps in database version tagging to allow T schema changes
     // to go independent of U schema changes.
-    static final int VERSION_U = 1403;
+    static final int VERSION_U = 1405;
     public static final int VERSION_LATEST = VERSION_U;
 
     /**
@@ -2267,15 +2253,14 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             if (fromVersion < 1400) {
                 // Empty version bump to ensure triggers are recreated
             }
-            // 1401 is intentionally skipped here, media_grants
-            // table changes will be updated in 1402.
-            if (fromVersion < 1402) {
+            if (fromVersion < 1404) {
+                // Empty version bump to ensure triggers are recreated
+            }
+
+            if (fromVersion < 1405) {
                 if (isExternal()) {
                     updateAddMediaGrantsTable(db);
                 }
-            }
-            if (fromVersion < 1403) {
-                // Empty version bump to ensure triggers are recreated
             }
 
             // If this is the legacy database, it's not worth recomputing data
@@ -2504,31 +2489,6 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         throw new RuntimeException(
                 String.format(Locale.ROOT, "Session id xattr key not defined for database:%s.",
                         mName));
-    }
-
-    private static boolean setXattr(String path, String key, String value) {
-        try (ParcelFileDescriptor pfd = ParcelFileDescriptor.open(new File(path),
-                ParcelFileDescriptor.MODE_READ_ONLY)) {
-            // Map id value to xattr key
-            Os.setxattr(path, key, value.getBytes(), 0);
-            Os.fsync(pfd.getFileDescriptor());
-            Log.d(TAG, String.format("xattr set to %s for key:%s on path: %s.", value, key, path));
-            return true;
-        } catch (Exception e) {
-            Log.e(TAG, String.format(Locale.ROOT, "Failed to set xattr:%s to %s for path: %s.", key,
-                    value, path), e);
-            return false;
-        }
-    }
-
-    private static Optional<String> getXattr(String path, String key) {
-        try {
-            return Optional.of(Arrays.toString(Os.getxattr(path, key)));
-        } catch (Exception e) {
-            Log.w(TAG, String.format(Locale.ROOT,
-                    "Exception encountered while reading xattr:%s from path:%s.", key, path));
-            return Optional.empty();
-        }
     }
 
     protected Optional<Long> getNextRowId() {
