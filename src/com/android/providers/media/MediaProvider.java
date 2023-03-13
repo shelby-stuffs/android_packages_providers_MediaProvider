@@ -22,8 +22,11 @@ import static android.app.AppOpsManager.permissionToOp;
 import static android.app.PendingIntent.FLAG_CANCEL_CURRENT;
 import static android.app.PendingIntent.FLAG_IMMUTABLE;
 import static android.app.PendingIntent.FLAG_ONE_SHOT;
+import static android.content.ContentResolver.QUERY_ARG_SQL_GROUP_BY;
+import static android.content.ContentResolver.QUERY_ARG_SQL_HAVING;
 import static android.content.ContentResolver.QUERY_ARG_SQL_SELECTION;
 import static android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS;
+import static android.content.ContentResolver.QUERY_ARG_SQL_SORT_ORDER;
 import static android.content.pm.PackageManager.PERMISSION_DENIED;
 import static android.content.pm.PackageManager.PERMISSION_GRANTED;
 import static android.database.Cursor.FIELD_TYPE_BLOB;
@@ -148,6 +151,7 @@ import static com.android.providers.media.util.FileUtils.toFuseFile;
 import static com.android.providers.media.util.Logging.LOGV;
 import static com.android.providers.media.util.Logging.TAG;
 import static com.android.providers.media.util.PermissionUtils.checkPermissionSelf;
+import static com.android.providers.media.util.PermissionUtils.checkPermissionShell;
 import static com.android.providers.media.util.StringUtils.componentStateToString;
 import static com.android.providers.media.util.SyntheticPathUtils.REDACTED_URI_ID_PREFIX;
 import static com.android.providers.media.util.SyntheticPathUtils.REDACTED_URI_ID_SIZE;
@@ -589,7 +593,63 @@ public class MediaProvider extends ContentProvider {
             new SparseArray<>();
 
     private final OnOpChangedListener mModeListener =
-            (op, packageName) -> invalidateLocalCallingIdentityCache(packageName, "op " + op);
+            (op, packageName) -> onModeChanged(packageName, op);
+
+    /**
+     * Callback method called as part of {@link OnOpChangedListener}.
+     * When an AppOp is written -
+     * 1. We invalidate saved LocalCallingIdentity object for the package. This
+     *    is needed to ensure we read the new permission state
+     * 2. If the AppOp change was on the read media appOps, we clear any stale
+     *    grants,
+     *
+     * @param packageName - package for which AppOp changed
+     * @param op - AppOp for which the mode changed.
+     */
+    private void onModeChanged(String packageName, String op) {
+        invalidateLocalCallingIdentityCache(packageName, "op " + op /* reason */);
+        removeMediaGrantsOnModeChange(packageName, op);
+    }
+
+    /**
+     * Removes media_grants for the given {@code packageName} if the AppOp
+     * change resulted in a state of "Allow All" or "Deny All" for read
+     * permission.
+     */
+    private void removeMediaGrantsOnModeChange(String packageName, String op) {
+        // b/265963379: onModeChanged is always called with op=OPSTR_READ_EXTERNAL_STORAGE even if
+        // the appOp mode changed for other read media app ops. Handle all read media app op changes
+        // until the bug is fixed.
+        if (!SdkLevel.isAtLeastU() || !isReadMediaAppOp(op)) {
+            return;
+        }
+
+        final int uid;
+        try {
+            uid = getContext().getPackageManager().getPackageUid(packageName, 0);
+        } catch (NameNotFoundException e) {
+            Log.e(TAG, "Unable to resolve uid. Ignoring the AppOp change for " + packageName);
+            return;
+        }
+
+        final LocalCallingIdentity localCallingIdentity =
+                LocalCallingIdentity.fromExternal(getContext(), mUserCache, uid);
+        if (!localCallingIdentity.checkCallingPermissionUserSelected()) {
+            // Revoke media grants if permission state is not "Select flow".
+            mMediaGrants.removeAllMediaGrantsForPackage(packageName, "op " + op /* reason */);
+        }
+    }
+
+    /**
+     * Returns {@code true} if the given {@code op} is one of the appOp
+     * related to read media appOps
+     */
+    private boolean isReadMediaAppOp(String op) {
+        return AppOpsManager.OPSTR_READ_EXTERNAL_STORAGE.equals(op)
+                || AppOpsManager.OPSTR_READ_MEDIA_IMAGES.equals(op)
+                || AppOpsManager.OPSTR_READ_MEDIA_VIDEO.equals(op)
+                || AppOpsManager.OPSTR_READ_MEDIA_VISUAL_USER_SELECTED.equals(op);
+    }
 
     /**
      * Retrieves a cached calling identity or creates a new one. Also, always sets the app-op
@@ -746,7 +806,13 @@ public class MediaProvider extends ContentProvider {
         }
     }
 
-    private void updateQuotaTypeForUri(@NonNull Uri uri, int mediaType) {
+    private void updateQuotaTypeForUri(@NonNull Uri uri, int mediaType,
+            @NonNull String volumeName) {
+        // Quota type is only updated for external primary volume
+        if (!MediaStore.VOLUME_EXTERNAL_PRIMARY.equalsIgnoreCase(volumeName)) {
+            return;
+        }
+
         Trace.beginSection("MP.updateQuotaTypeForUri");
         File file;
         try {
@@ -817,7 +883,8 @@ public class MediaProvider extends ContentProvider {
                     // Update the quota type on the filesystem
                     Uri fileUri = MediaStore.Files.getContentUri(insertedRow.getVolumeName(),
                             insertedRow.getId());
-                    updateQuotaTypeForUri(fileUri, insertedRow.getMediaType());
+                    updateQuotaTypeForUri(fileUri, insertedRow.getMediaType(),
+                            insertedRow.getVolumeName());
                 }
 
                 // Tell our SAF provider so it knows when views are no longer empty
@@ -852,7 +919,7 @@ public class MediaProvider extends ContentProvider {
             helper.postBackground(() -> {
                 if (helper.isExternal()) {
                     // Update the quota type on the filesystem
-                    updateQuotaTypeForUri(fileUri, newRow.getMediaType());
+                    updateQuotaTypeForUri(fileUri, newRow.getMediaType(), oldRow.getVolumeName());
                 }
 
                 if (mExternalDbFacade.onFileUpdated(oldRow.getId(),
@@ -1198,6 +1265,10 @@ public class MediaProvider extends ContentProvider {
                 null /* all packages */, mModeListener);
         appOpsManager.startWatchingMode(AppOpsManager.OPSTR_READ_MEDIA_VIDEO,
                 null /* all packages */, mModeListener);
+        if (SdkLevel.isAtLeastU()) {
+            appOpsManager.startWatchingMode(AppOpsManager.OPSTR_READ_MEDIA_VISUAL_USER_SELECTED,
+                    null /* all packages */, mModeListener);
+        }
         appOpsManager.startWatchingMode(AppOpsManager.OPSTR_WRITE_EXTERNAL_STORAGE,
                 null /* all packages */, mModeListener);
         appOpsManager.startWatchingMode(permissionToOp(ACCESS_MEDIA_LOCATION),
@@ -1752,7 +1823,7 @@ public class MediaProvider extends ContentProvider {
         // Orphan rest of entries.
         orphanEntries(db, packageName, userId);
         // TODO(b/260685885): Add e2e tests to ensure these are cleared when a package is removed.
-        mMediaGrants.removeAllMediaGrantsForPackage(packageName);
+        mMediaGrants.removeAllMediaGrantsForPackage(packageName, /* reason */ "Package orphaned");
     }
 
     private void deleteAndroidMediaEntries(SQLiteDatabase db, String packageName, int userId) {
@@ -3478,8 +3549,7 @@ public class MediaProvider extends ContentProvider {
 
         // Starting U, we are filtering owner package names for apps without visibility
         // on other packages. Apps with QUERY_ALL_PACKAGES permission are not affected.
-        final boolean shouldFilterOwnerPackageNameFlag = true;
-        if (shouldFilterOwnerPackageNameFlag && isApplicableForOwnerPackageNameFiltering(c)) {
+        if (shouldFilterOwnerPackageNameFlag() && isApplicableForOwnerPackageNameFiltering(c)) {
             final long startTime = SystemClock.elapsedRealtime();
             final String[] resultOwnerPackageNames = getOwnerPackageNames(c);
             if (resultOwnerPackageNames.length != 0) {
@@ -3579,6 +3649,10 @@ public class MediaProvider extends ContentProvider {
                 && Arrays.asList(c.getColumnNames()).contains(MediaColumns.OWNER_PACKAGE_NAME)
                 && getContext().checkPermission(QUERY_ALL_PACKAGES,
                 mCallingIdentity.get().pid, mCallingIdentity.get().uid) == PERMISSION_DENIED;
+    }
+
+    private boolean shouldFilterOwnerPackageNameFlag() {
+        return true;
     }
 
     private boolean isUriSupportedForRedaction(Uri uri) {
@@ -5373,7 +5447,7 @@ public class MediaProvider extends ContentProvider {
         // to commit to this as an API.
         final boolean includeAllVolumes = shouldIncludeRecentlyUnmountedVolumes(uri, extras);
 
-        appendAccessCheckQuery(qb, forWrite, uri, match, extras);
+        appendAccessCheckQuery(qb, forWrite, uri, match, extras, volumeName);
 
         switch (match) {
             case IMAGES_MEDIA_ID:
@@ -5737,11 +5811,41 @@ public class MediaProvider extends ContentProvider {
             qb.setProjectionGreylist(sGreylist);
         }
 
+        // Starting U, if owner package name is used in query arguments,
+        // we are restricting result set to only self-owned packages.
+        if (shouldFilterOwnerPackageNameFlag() && shouldFilterByOwnerPackageName(extras, type)) {
+            Log.d(TAG, "Restricting result set to only packages owned by calling package: "
+                    + mCallingIdentity.get().getSharedPackagesAsString());
+            final String ownerPackageMatchClause = getWhereForOwnerPackageMatch(
+                    mCallingIdentity.get());
+            appendWhereStandalone(qb, ownerPackageMatchClause);
+        }
+
         return qb;
     }
 
+    private boolean shouldFilterByOwnerPackageName(Bundle queryArgs, int type) {
+        return type == TYPE_QUERY && SdkLevel.isAtLeastU() && containsOwnerPackageName(queryArgs)
+                && getContext().checkPermission(QUERY_ALL_PACKAGES, mCallingIdentity.get().pid,
+                mCallingIdentity.get().uid) == PERMISSION_DENIED;
+    }
+
+    private boolean containsOwnerPackageName(Bundle queryArgs) {
+        final String selection = queryArgs.getString(QUERY_ARG_SQL_SELECTION, "")
+                .toLowerCase(Locale.ROOT);
+        final String groupBy = queryArgs.getString(QUERY_ARG_SQL_GROUP_BY, "")
+                .toLowerCase(Locale.ROOT);
+        final String sort = queryArgs.getString(QUERY_ARG_SQL_SORT_ORDER, "")
+                .toLowerCase(Locale.ROOT);
+        final String having = queryArgs.getString(QUERY_ARG_SQL_HAVING, "")
+                .toLowerCase(Locale.ROOT);
+
+        return selection.contains(OWNER_PACKAGE_NAME) || groupBy.contains(OWNER_PACKAGE_NAME)
+                || sort.contains(OWNER_PACKAGE_NAME) || having.contains(OWNER_PACKAGE_NAME);
+    }
+
     private void appendAccessCheckQuery(@NonNull SQLiteQueryBuilder qb, boolean forWrite,
-            @NonNull Uri uri, int uriType, @NonNull Bundle extras) {
+            @NonNull Uri uri, int uriType, @NonNull Bundle extras, @NonNull String volumeName) {
         Objects.requireNonNull(extras);
         final Uri redactedUri = extras.getParcelable(QUERY_ARG_REDACTED_URI);
 
@@ -5762,10 +5866,12 @@ public class MediaProvider extends ContentProvider {
         }
 
         final ArrayList<String> options = new ArrayList<>();
-        if (hasUserSelectedAccess(mCallingIdentity.get(), uriType, forWrite)) {
+        if (!MediaStore.VOLUME_INTERNAL.equals(volumeName)
+                && hasUserSelectedAccess(mCallingIdentity.get(), uriType, forWrite)) {
             // If app has READ_MEDIA_VISUAL_USER_SELECTED permission, allow access on files granted
             // via PhotoPicker launched for Permission. These grants are defined in media_grants
             // table.
+            // We exclude volume internal from the query because media_grants are not supported.
             options.add(getWhereForUserSelectedAccess(mCallingIdentity.get(), uriType));
         }
 
@@ -6393,18 +6499,43 @@ public class MediaProvider extends ContentProvider {
                 }
             }
             case MediaStore.GRANT_MEDIA_READ_FOR_PACKAGE_CALL: {
-                if (!checkPermissionSelf(Binder.getCallingUid())) {
+                final int caller = Binder.getCallingUid();
+                final List<Uri> uris;
+                final String packageName;
+                if (checkPermissionSelf(caller)) {
+                    // If the caller is MediaProvider the accepted parameters are EXTRA_URI_LIST
+                    // and EXTRA_UID.
+                    if (!extras.containsKey(
+                            MediaStore.EXTRA_URI_LIST)
+                                    && !extras.containsKey(Intent.EXTRA_UID)) {
+                        throw new IllegalArgumentException(
+                                "Missing required extras arguments: EXTRA_URI_LIST or"
+                                    + " EXTRA_UID");
+                    }
+                    uris = extras.getParcelableArrayList(MediaStore.EXTRA_URI_LIST);
+                    final PackageManager pm = getContext().getPackageManager();
+                    final int packageUid = extras.getInt(Intent.EXTRA_UID);
+                    packageName = pm.getNameForUid(packageUid);
+                } else if (checkPermissionShell(caller)) {
+                    // If the caller is the shell, the accepted parameters are EXTRA_URI (as string)
+                    // and EXTRA_PACKAGE_NAME (as string).
+                    if (!extras.containsKey(MediaStore.EXTRA_URI)
+                                    && !extras.containsKey(Intent.EXTRA_PACKAGE_NAME)) {
+                        throw new IllegalArgumentException(
+                                "Missing required extras arguments: EXTRA_URI or"
+                                    + " EXTRA_PACKAGE_NAME");
+                    }
+                    packageName = extras.getString(Intent.EXTRA_PACKAGE_NAME);
+                    uris = List.of(Uri.parse(extras.getString(MediaStore.EXTRA_URI)));
+                } else {
+                    // All other callers are unauthorized.
                     throw new SecurityException("Create media grants not allowed. "
-                            + " Calling app ID:" + UserHandle.getAppId(Binder.getCallingUid())
-                            + " Calling UID:" + Binder.getCallingUid()
-                            + " Media Provider app ID:" + UserHandle.getAppId(MY_UID)
-                            + " Media Provider UID:" + MY_UID);
+                                + " Calling app ID:" + UserHandle.getAppId(Binder.getCallingUid())
+                                + " Calling UID:" + Binder.getCallingUid()
+                                + " Media Provider app ID:" + UserHandle.getAppId(MY_UID)
+                                + " Media Provider UID:" + MY_UID);
                 }
-                final int packageUid = extras.getInt(Intent.EXTRA_UID);
-                final ArrayList<Uri> uris =
-                            extras.getParcelableArrayList(MediaStore.EXTRA_URI_LIST);
-                final PackageManager pm = getContext().getPackageManager();
-                final String packageName = pm.getNameForUid(packageUid);
+
                 mMediaGrants.addMediaGrantsForPackage(packageName, uris);
                 return null;
             }
@@ -6450,11 +6581,17 @@ public class MediaProvider extends ContentProvider {
                 return bundle;
             }
             case MediaStore.SET_CLOUD_PROVIDER_CALL: {
-                // TODO(b/190713331): Remove after initial development
+                // TODO(b/267327327): Add permission check before updating cloud provider. Also
+                //  validate the new cloud provider before setting it by using
+                //  PickerSyncController#setCloudProvider instead of
+                //  PickerSyncController#forceSetCloudProvider.
                 final String cloudProvider = extras.getString(MediaStore.EXTRA_CLOUD_PROVIDER);
-                Log.i(TAG, "Test initiated cloud provider switch: " + cloudProvider);
+                Log.i(TAG, "Request received to set cloud provider to " + cloudProvider);
                 mPickerSyncController.forceSetCloudProvider(cloudProvider);
-                // fall-through
+                Log.i(TAG, "Completed request to set cloud provider to " + cloudProvider);
+
+                mPickerSyncController.reloadAllMediaAsync();
+                return new Bundle();
             }
             case MediaStore.SYNC_PROVIDERS_CALL: {
                 syncAllMedia();
@@ -10487,15 +10624,52 @@ public class MediaProvider extends ContentProvider {
         final String maybeAs = "( (as )?[_a-z0-9]+)?";
         addGreylistPattern("(?i)[_a-z0-9]+" + maybeAs);
         addGreylistPattern("audio\\._id AS _id");
-        addGreylistPattern("(?i)(min|max|sum|avg|total|count|cast)\\(([_a-z0-9]+" + maybeAs + "|\\*)\\)" + maybeAs);
-        addGreylistPattern("case when case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added \\* \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added / \\d+ else \\d+ end > case when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified \\* \\d+ when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified / \\d+ else \\d+ end then case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added \\* \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added / \\d+ else \\d+ end else case when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified \\* \\d+ when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified / \\d+ else \\d+ end end as corrected_added_modified");
-        addGreylistPattern("MAX\\(case when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken \\* \\d+ when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken / \\d+ else \\d+ end\\)");
-        addGreylistPattern("MAX\\(case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added \\* \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added / \\d+ else \\d+ end\\)");
-        addGreylistPattern("MAX\\(case when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified \\* \\d+ when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified when \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified / \\d+ else \\d+ end\\)");
+        addGreylistPattern(
+                "(?i)(min|max|sum|avg|total|count|cast)\\(([_a-z0-9]+"
+                        + maybeAs
+                        + "|\\*)\\)"
+                        + maybeAs);
+        addGreylistPattern(
+                "case when case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added"
+                    + " \\* \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then"
+                    + " date_added when \\(date_added >= \\d+ and date_added < \\d+\\) then"
+                    + " date_added / \\d+ else \\d+ end > case when \\(date_modified >= \\d+ and"
+                    + " date_modified < \\d+\\) then date_modified \\* \\d+ when \\(date_modified"
+                    + " >= \\d+ and date_modified < \\d+\\) then date_modified when"
+                    + " \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified /"
+                    + " \\d+ else \\d+ end then case when \\(date_added >= \\d+ and date_added <"
+                    + " \\d+\\) then date_added \\* \\d+ when \\(date_added >= \\d+ and date_added"
+                    + " < \\d+\\) then date_added when \\(date_added >= \\d+ and date_added <"
+                    + " \\d+\\) then date_added / \\d+ else \\d+ end else case when"
+                    + " \\(date_modified >= \\d+ and date_modified < \\d+\\) then date_modified \\*"
+                    + " \\d+ when \\(date_modified >= \\d+ and date_modified < \\d+\\) then"
+                    + " date_modified when \\(date_modified >= \\d+ and date_modified < \\d+\\)"
+                    + " then date_modified / \\d+ else \\d+ end end as corrected_added_modified");
+        addGreylistPattern(
+                "MAX\\(case when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken \\*"
+                    + " \\d+ when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken when"
+                    + " \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken / \\d+ else"
+                    + " \\d+ end\\)");
+        addGreylistPattern(
+                "MAX\\(case when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added \\*"
+                    + " \\d+ when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added"
+                    + " when \\(date_added >= \\d+ and date_added < \\d+\\) then date_added / \\d+"
+                    + " else \\d+ end\\)");
+        addGreylistPattern(
+                "MAX\\(case when \\(date_modified >= \\d+ and date_modified < \\d+\\) then"
+                    + " date_modified \\* \\d+ when \\(date_modified >= \\d+ and date_modified <"
+                    + " \\d+\\) then date_modified when \\(date_modified >= \\d+ and date_modified"
+                    + " < \\d+\\) then date_modified / \\d+ else \\d+ end\\)");
         addGreylistPattern("\"content://media/[a-z]+/audio/media\"");
-        addGreylistPattern("substr\\(_data, length\\(_data\\)-length\\(_display_name\\), 1\\) as filename_prevchar");
+        addGreylistPattern(
+                "substr\\(_data, length\\(_data\\)-length\\(_display_name\\), 1\\) as"
+                    + " filename_prevchar");
         addGreylistPattern("\\*" + maybeAs);
-        addGreylistPattern("case when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken \\* \\d+ when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken / \\d+ else \\d+ end");
+        addGreylistPattern(
+                "case when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken \\* \\d+"
+                    + " when \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken when"
+                    + " \\(datetaken >= \\d+ and datetaken < \\d+\\) then datetaken / \\d+ else"
+                    + " \\d+ end");
     }
 
     public ArrayMap<String, String> getProjectionMap(Class<?>... clazzes) {
