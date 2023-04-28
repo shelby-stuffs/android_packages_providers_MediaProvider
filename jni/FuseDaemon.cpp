@@ -18,6 +18,7 @@
 
 #include "FuseDaemon.h"
 
+#include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/strings.h>
@@ -2360,18 +2361,20 @@ bool FuseDaemon::IsStarted() const {
 }
 
 bool IsFuseBpfEnabled() {
-    // TODO b/262887267 Once kernel supports flag, trigger off kernel flag unless
-    //      ro.fuse.bpf.enabled is explicitly set to false
-
     // ro.fuse.bpf.is_running may not be set when first reading this property, so we have to
     // reproduce the vold/Utils.cpp:isFuseBpfEnabled() logic here
+
     if (android::base::GetProperty("ro.fuse.bpf.is_running", "") != "") {
         return android::base::GetBoolProperty("ro.fuse.bpf.is_running", false);
     } else if (android::base::GetProperty("persist.sys.fuse.bpf.override", "") != "") {
         return android::base::GetBoolProperty("persist.sys.fuse.bpf.override", false);
-    } else {
+    } else if (android::base::GetProperty("ro.fuse.bpf.enabled", "") != "") {
         return android::base::GetBoolProperty("ro.fuse.bpf.enabled", false);
     }
+
+    string contents;
+    return android::base::ReadFileToString("/sys/fs/fuse/features/fuse_bpf", &contents) &&
+           contents == "supported\n";
 }
 
 void FuseDaemon::Start(android::base::unique_fd fd, const std::string& path,
@@ -2676,6 +2679,25 @@ void FuseDaemon::CreateOwnerIdRelation(const std::string& ownerId,
         LOG(ERROR) << "Failure in leveldb insert for owner_id: " << ownerId
                    << " and ownerPackageIdentifier:" << ownerPackageIdentifier;
     }
+}
+
+std::map<std::string, std::string> FuseDaemon::GetOwnerRelationship() {
+    std::map<std::string, std::string> resultMap;
+    if (!CheckLevelDbConnection(OWNERSHIP_RELATION)) {
+        LOG(ERROR) << "Failure in leveldb read for ownership relation.";
+        return resultMap;
+    }
+
+    leveldb::Status status;
+    // Get the key-value pairs from the database.
+    leveldb::Iterator* it =
+            fuse->level_db_connection_map[OWNERSHIP_RELATION]->NewIterator(leveldb::ReadOptions());
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+        std::string key = it->key().ToString();
+        std::string value = it->value().ToString();
+        resultMap.insert(std::pair<std::string, std::string>(key, value));
+    }
+    return resultMap;
 }
 
 bool FuseDaemon::CheckLevelDbConnection(const std::string& instance_name) {

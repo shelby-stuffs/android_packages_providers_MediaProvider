@@ -49,6 +49,7 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -145,6 +146,8 @@ public class DatabaseBackupAndRecovery {
     private AtomicInteger mNextOwnerIdBackup;
     private final ConfigStore mConfigStore;
     private final VolumeCache mVolumeCache;
+
+    private Map<String, String> mOwnerIdRelationMap;
 
     protected DatabaseBackupAndRecovery(ConfigStore configStore, VolumeCache volumeCache) {
         mConfigStore = configStore;
@@ -298,9 +301,6 @@ public class DatabaseBackupAndRecovery {
                 EXTERNAL_PRIMARY_VOLUME_BACKUP_PATH, LAST_BACKEDUP_GENERATION_XATTR_KEY);
         long lastBackedGenerationNumber = lastBackedUpGenNum.isPresent()
                 ? lastBackedUpGenNum.get() : 0;
-        if (lastBackedGenerationNumber > 0) {
-            Log.i(TAG, "Last backed up generation number is " + lastBackedGenerationNumber);
-        }
         final String generationClause = MediaStore.Files.FileColumns.GENERATION_MODIFIED + " > "
                 + lastBackedGenerationNumber;
         final String volumeClause = MediaStore.Files.FileColumns.VOLUME_NAME + " = '"
@@ -463,7 +463,7 @@ public class DatabaseBackupAndRecovery {
 
     private int getOwnerPackageId(FuseDaemon fuseDaemon, String ownerPackageName, int userId)
             throws IOException {
-        if (Strings.isNullOrEmpty(ownerPackageName)) {
+        if (Strings.isNullOrEmpty(ownerPackageName) || ownerPackageName.equalsIgnoreCase("null")) {
             // We store -1 in the backup if owner package name is null.
             return -1;
         }
@@ -707,16 +707,22 @@ public class DatabaseBackupAndRecovery {
         return values;
     }
 
-    protected Pair<String, Integer> getOwnerPackageNameAndUidPair(int ownerPackageId) {
-        try {
-            String ownerPackageIdentifier = getFuseDaemonForPath(
-                    EXTERNAL_PRIMARY_ROOT_PATH).readFromOwnershipBackup(
-                    String.valueOf(ownerPackageId));
-            return getPackageNameAndUserId(ownerPackageIdentifier);
-        } catch (IOException e) {
-            Log.e(TAG, "Failure in reading owner details for owner id:" + ownerPackageId, e);
-            return Pair.create(null, null);
+    private Pair<String, Integer> getOwnerPackageNameAndUidPair(int ownerPackageId) {
+        if (mOwnerIdRelationMap == null) {
+            try {
+                mOwnerIdRelationMap = getFuseDaemonForPath(
+                        EXTERNAL_PRIMARY_ROOT_PATH).readOwnerIdRelations();
+                Log.i(TAG, "Cached owner id map");
+            } catch (IOException e) {
+                Log.e(TAG, "Failure in reading owner details for owner id:" + ownerPackageId, e);
+                return Pair.create(null, null);
+            }
         }
+
+        if (mOwnerIdRelationMap.containsKey(String.valueOf(ownerPackageId))) {
+            return getPackageNameAndUserId(mOwnerIdRelationMap.get(String.valueOf(ownerPackageId)));
+        }
+        return Pair.create(null, null);
     }
 
     protected void recoverData(SQLiteDatabase db, String volumeName) {
@@ -772,11 +778,6 @@ public class DatabaseBackupAndRecovery {
                 getVolumeNameForStatsLog(volumeName), recoveryTime, rowsRecovered, dirtyRowsCount);
         Log.i(TAG, String.format(Locale.ROOT, "%d rows recovered for volume:%s.", rowsRecovered,
                 volumeName));
-        if (MediaStore.VOLUME_EXTERNAL_PRIMARY.equalsIgnoreCase(volumeName)) {
-            // Resetting generation number
-            setXattr(EXTERNAL_PRIMARY_VOLUME_BACKUP_PATH, LAST_BACKEDUP_GENERATION_XATTR_KEY,
-                    String.valueOf(0));
-        }
         Log.i(TAG, String.format(Locale.ROOT, "Recovery time: %d ms", recoveryTime));
     }
 
