@@ -186,8 +186,11 @@ public class PhotoPickerActivity extends AppCompatActivity {
         am.addAccessibilityStateChangeListener(enabled -> mIsAccessibilityEnabled = enabled);
 
         initBottomSheetBehavior();
+        restoreState(savedInstanceState);
 
         final String intentAction = intent != null ? intent.getAction() : null;
+        // Call this after state is restored, to use the correct LOGGER_INSTANCE_ID_ARG
+        mPickerViewModel.logPickerOpened(Binder.getCallingUid(), getCallingPackage(), intentAction);
 
         // Save the fragment container layout so that we can adjust the padding based on preview or
         // non-preview mode.
@@ -199,12 +202,6 @@ public class PhotoPickerActivity extends AppCompatActivity {
         if (mPreloaderInstanceHolder.preloader != null) {
             subscribeToSelectedMediaPreloader(mPreloaderInstanceHolder.preloader);
         }
-
-        // Don't add any logic after this line.
-        restoreState(savedInstanceState);
-
-        // Call this after state is restored, to use the correct LOGGER_INSTANCE_ID_ARG
-        mPickerViewModel.logPickerOpened(Binder.getCallingUid(), getCallingPackage(), intentAction);
     }
 
     @Override
@@ -604,9 +601,8 @@ public class PhotoPickerActivity extends AppCompatActivity {
     /**
      * NOTE: this may wrongly return {@code false} if called before {@link PickerViewModel} had a
      * chance to fetch the authority and the account of the current
-     * {@link android.provider.CloudMediaProvider}. However, {@link PickerViewModel} initiates the
-     * "fetch" through {@link PickerViewModel#maybeInitialiseAndSetBannersForCurrentUser()} in its
-     * ctor, so this may only happen very early on in the lifecycle.
+     * {@link android.provider.CloudMediaProvider}.
+     * However, this may only happen very early on in the lifecycle.
      */
     private boolean isCloudMediaAvailable() {
         return mPickerViewModel.getCloudMediaProviderAuthorityLiveData().getValue() != null
