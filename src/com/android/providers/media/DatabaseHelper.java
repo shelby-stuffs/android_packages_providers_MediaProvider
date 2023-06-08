@@ -357,7 +357,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         db.setCustomScalarFunction("_INSERT", (arg) -> {
             if (arg != null && mFilesListener != null
                     && !mSchemaLock.isWriteLockedByCurrentThread()) {
-                final String[] split = arg.split(":", 10);
+                final String[] split = arg.split(":", 11);
                 final String volumeName = split[0];
                 final long id = Long.parseLong(split[1]);
                 final int mediaType = Integer.parseInt(split[2]);
@@ -367,7 +367,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 final boolean isFavorite = Integer.parseInt(split[6]) != 0;
                 final int userId = Integer.parseInt(split[7]);
                 final String dateExpires = split[8];
-                final String path = split[9];
+                final String ownerPackageName = split[9];
+                final String path = split[10];
 
                 FileRow insertedRow = FileRow.newBuilder(id)
                         .setVolumeName(volumeName)
@@ -378,6 +379,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                         .setIsFavorite(isFavorite)
                         .setUserId(userId)
                         .setDateExpires(dateExpires)
+                        .setOwnerPackageName(ownerPackageName)
                         .setPath(path)
                         .build();
                 Trace.beginSection(traceSectionName("_INSERT"));
@@ -1108,16 +1110,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             db.execSQL("CREATE TABLE audio_playlists_map (_id INTEGER PRIMARY KEY,"
                     + "audio_id INTEGER NOT NULL,playlist_id INTEGER NOT NULL,"
                     + "play_order INTEGER NOT NULL)");
-            db.execSQL(
-                    "CREATE TABLE media_grants ("
-                            + "owner_package_name TEXT,"
-                            + "file_id INTEGER,"
-                            + "package_user_id INTEGER,"
-                            + "UNIQUE(owner_package_name, file_id) ON CONFLICT IGNORE "
-                            + "FOREIGN KEY (file_id)"
-                            + "  REFERENCES files(_id)"
-                            + "  ON DELETE CASCADE"
-                            + ")");
+            updateAddMediaGrantsTable(db);
         }
 
         createLatestViews(db);
@@ -1588,7 +1581,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 "new.volume_name||':'||new._id||':'||new.media_type||':'||new"
                         + ".is_download||':'||new.is_pending||':'||new.is_trashed||':'||new"
                         + ".is_favorite||':'||new._user_id||':'||ifnull(new.date_expires,'null')"
-                        + "||':'||new._data";
+                        + "||':'||ifnull(new.owner_package_name,'null')||':'||new._data";
         final String updateArg =
                 "old.volume_name||':'||old._id||':'||old.media_type||':'||old.is_download"
                         + "||':'||new._id||':'||new.media_type||':'||new.is_download"
@@ -1886,7 +1879,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                         + "owner_package_name TEXT,"
                         + "file_id INTEGER,"
                         + "package_user_id INTEGER,"
-                        + "UNIQUE(owner_package_name, file_id) ON CONFLICT IGNORE "
+                        + "UNIQUE(owner_package_name, file_id, package_user_id)"
+                        + "  ON CONFLICT IGNORE "
                         + "FOREIGN KEY (file_id)"
                         + "  REFERENCES files(_id)"
                         + "  ON DELETE CASCADE"
@@ -1963,7 +1957,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     static final int VERSION_T = 1308;
     // Leave some gaps in database version tagging to allow T schema changes
     // to go independent of U schema changes.
-    static final int VERSION_U = 1405;
+    static final int VERSION_U = 1407;
     public static final int VERSION_LATEST = VERSION_U;
 
     /**
@@ -2170,7 +2164,11 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 // Empty version bump to ensure triggers are recreated
             }
 
-            if (fromVersion < 1405) {
+            if (fromVersion < 1406) {
+                // Empty version bump to ensure triggers are recreated
+            }
+
+            if (fromVersion < 1407) {
                 if (isExternal()) {
                     updateAddMediaGrantsTable(db);
                 }

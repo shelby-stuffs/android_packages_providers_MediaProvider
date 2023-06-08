@@ -599,31 +599,47 @@ public class MediaProvider extends ContentProvider {
     private final SparseArray<LocalCallingIdentity> mCachedCallingIdentityForFuse =
             new SparseArray<>();
 
-    private final OnOpChangedListener mModeListener =
-            (op, packageName) -> onModeChanged(packageName, op);
+    private final OnOpChangedListener mModeListener = new OnOpChangedListener() {
+
+        /**
+         * Callback method called as part of {@link OnOpChangedListener}.
+         * Calls {@link #onOpChanged(String, String, int)} with cached userId(s).
+         *
+         * @param packageName - package for which AppOp changed
+         * @param op - AppOp for which the mode changed.
+         */
+        public void onOpChanged(String op, String packageName) {
+            // In case no userId is supplied, we drop grants for all cached users.
+            List<UserHandle> userHandles = mUserCache.getUsersCached();
+            for (UserHandle user : userHandles) {
+                onOpChanged(op, packageName, user.getIdentifier());
+            }
+        }
+
+        /**
+         * Callback method called as part of {@link OnOpChangedListener}.
+         * When an AppOp is written -
+         * 1. We invalidate saved LocalCallingIdentity object for the package. This
+         *    is needed to ensure we read the new permission state
+         * 2. If the AppOp change was on the read media appOps, we clear any stale
+         *    grants,
+         *
+         * @param packageName - package for which AppOp changed
+         * @param op - AppOp for which the mode changed.
+         * @param userId - userSpace where the package is located
+         */
+        public void onOpChanged(String op, String packageName, int userId) {
+            invalidateLocalCallingIdentityCache(packageName, "op " + op /* reason */);
+            removeMediaGrantsOnModeChange(packageName, op, userId);
+        }
+    };
 
     /**
-     * Callback method called as part of {@link OnOpChangedListener}.
-     * When an AppOp is written -
-     * 1. We invalidate saved LocalCallingIdentity object for the package. This
-     *    is needed to ensure we read the new permission state
-     * 2. If the AppOp change was on the read media appOps, we clear any stale
-     *    grants,
-     *
-     * @param packageName - package for which AppOp changed
-     * @param op - AppOp for which the mode changed.
-     */
-    private void onModeChanged(String packageName, String op) {
-        invalidateLocalCallingIdentityCache(packageName, "op " + op /* reason */);
-        removeMediaGrantsOnModeChange(packageName, op);
-    }
-
-    /**
-     * Removes media_grants for the given {@code packageName} if the AppOp
+     * Removes media_grants for the given {@code packageName} and {@code userId} if the AppOp
      * change resulted in a state of "Allow All" or "Deny All" for read
      * permission.
      */
-    private void removeMediaGrantsOnModeChange(String packageName, String op) {
+    private void removeMediaGrantsOnModeChange(String packageName, String op, int userId) {
         // b/265963379: onModeChanged is always called with op=OPSTR_READ_EXTERNAL_STORAGE even if
         // the appOp mode changed for other read media app ops. Handle all read media app op changes
         // until the bug is fixed.
@@ -632,22 +648,20 @@ public class MediaProvider extends ContentProvider {
         }
         Context context = getContext();
         PackageManager packageManager = context.getPackageManager();
-        List<UserHandle> userHandles = mUserCache.getUsersCached();
-        for (UserHandle user : userHandles) {
-            try {
-                int uid = packageManager.getPackageUid(packageName, user.getIdentifier());
-                if (!LocalCallingIdentity.fromExternal(context, mUserCache, uid)
-                        .checkCallingPermissionUserSelected()) {
-                    // If for any user profile containing the package, the UserSelected permission
-                    // has been removed then remove all media grants for that package.
-                    // Revoke media grants if permission state is not "Select flow".
-                    mMediaGrants.removeAllMediaGrantsForPackage(packageName, "op "
-                            + op /* reason */, user.getIdentifier());
-                }
-            } catch (NameNotFoundException e) {
-                Log.d(TAG, "Unable to resolve uid. Ignoring the AppOp change for "
-                        + packageName + ", User : " + user.getIdentifier());
+        try {
+            int uid = packageManager.getPackageUidAsUser(packageName,
+                    PackageManager.PackageInfoFlags.of(0), userId);
+            if (!LocalCallingIdentity.fromExternal(context, mUserCache, uid)
+                    .checkCallingPermissionUserSelected()) {
+                // Revoke media grants if permission state is not "Select flow".
+                mMediaGrants.removeAllMediaGrantsForPackage(
+                        packageName,
+                        /*reason=*/ "Mode changed: " + op,
+                        userId);
             }
+        } catch (NameNotFoundException e) {
+            Log.d(TAG, "Unable to resolve uid. Ignoring the AppOp change for "
+                    + packageName + ", User : " + userId);
         }
     }
 
@@ -934,7 +948,7 @@ public class MediaProvider extends ContentProvider {
             acceptWithExpansion(helper::notifyUpdate, oldRow.getVolumeName(), oldRow.getId(),
                     oldRow.getMediaType(), isDownload);
 
-            mDatabaseBackupAndRecovery.updateNextRowIdAndSetDirtyIfRequired(helper, oldRow, newRow);
+            mDatabaseBackupAndRecovery.updateNextRowIdAndSetDirty(helper, oldRow, newRow);
 
             helper.postBackground(() -> {
                 if (helper.isExternal()) {
@@ -950,6 +964,8 @@ public class MediaProvider extends ContentProvider {
                         oldRow.getSpecialFormat(), newRow.getSpecialFormat())) {
                     mPickerSyncController.notifyMediaEvent();
                 }
+
+                mDatabaseBackupAndRecovery.updateBackup(helper, oldRow, newRow);
             });
 
             if (newRow.getMediaType() != oldRow.getMediaType()) {
@@ -1361,8 +1377,13 @@ public class MediaProvider extends ContentProvider {
 
     @VisibleForTesting
     protected void storageNativeBootPropertyChangeListener() {
-        setComponentEnabledSetting("PhotoPickerGetContentActivity",
-                mConfigStore.isGetContentTakeOverEnabled());
+        boolean isGetContentTakeoverEnabled;
+        if (SdkLevel.isAtLeastT()) {
+            isGetContentTakeoverEnabled = true;
+        } else {
+            isGetContentTakeoverEnabled = mConfigStore.isGetContentTakeOverEnabled();
+        }
+        setComponentEnabledSetting("PhotoPickerGetContentActivity", isGetContentTakeoverEnabled);
 
         setComponentEnabledSetting("PhotoPickerUserSelectActivity",
                 mConfigStore.isUserSelectForAppEnabled());
@@ -1851,7 +1872,7 @@ public class MediaProvider extends ContentProvider {
 
     /**
      * Orphan any content of the given package from the given database. This will delete
-     * Android/media files from the database if the underlying file no longe exists.
+     * Android/media files from the database if the underlying file no longer exists.
      */
     public void onPackageOrphaned(@NonNull SQLiteDatabase db,
             @NonNull String packageName, int userId) {
@@ -1859,6 +1880,7 @@ public class MediaProvider extends ContentProvider {
         deleteAndroidMediaEntries(db, packageName, userId);
         // Orphan rest of entries.
         orphanEntries(db, packageName, userId);
+        mDatabaseBackupAndRecovery.removeOwnerIdToPackageRelation(packageName, userId);
         // TODO(b/260685885): Add e2e tests to ensure these are cleared when a package is removed.
         mMediaGrants.removeAllMediaGrantsForPackage(packageName, /* reason */ "Package orphaned",
                 userId);
@@ -6551,7 +6573,7 @@ public class MediaProvider extends ContentProvider {
             }
             case MediaStore.GRANT_MEDIA_READ_FOR_PACKAGE_CALL: {
                 final int caller = Binder.getCallingUid();
-                final int userId = uidToUserId(caller);
+                int userId;
                 final List<Uri> uris;
                 String packageName;
                 if (checkPermissionSelf(caller)) {
@@ -6568,6 +6590,10 @@ public class MediaProvider extends ContentProvider {
                     final PackageManager pm = getContext().getPackageManager();
                     final int packageUid = extras.getInt(Intent.EXTRA_UID);
                     packageName = pm.getNameForUid(packageUid);
+                    // Get the userId from packageUid as the initiator could be a cloned app, which
+                    // accesses Media via MP of its parent user and Binder's callingUid reflects
+                    // the latter.
+                    userId = uidToUserId(packageUid);
                     if (packageName.contains(":")) {
                         // Check if the package name includes the package uid. This is expected
                         // for packages that are referencing a shared user. PackageManager will
@@ -6585,6 +6611,7 @@ public class MediaProvider extends ContentProvider {
                     }
                     packageName = extras.getString(Intent.EXTRA_PACKAGE_NAME);
                     uris = List.of(Uri.parse(extras.getString(MediaStore.EXTRA_URI)));
+                    userId = uidToUserId(caller);
                 } else {
                     // All other callers are unauthorized.
                     throw new SecurityException("Create media grants not allowed. "
@@ -6703,9 +6730,6 @@ public class MediaProvider extends ContentProvider {
                 return bundle;
             }
             case MediaStore.RUN_IDLE_MAINTENANCE_FOR_STABLE_URIS: {
-                getContext().enforceCallingPermission(Manifest.permission.WRITE_MEDIA_STORAGE,
-                        "Permission missing to call RUN_IDLE_MAINTENANCE_FOR_STABLE_URIS by "
-                                + "uid:" + Binder.getCallingUid());
                 backupDatabases(null);
                 return new Bundle();
             }
